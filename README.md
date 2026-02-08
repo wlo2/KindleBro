@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icon.png" alt="KindleBro Logo" width="160">
+</p>
+
 # KindleBro
 KindleBro is a minimal, native Apple-silicon macOS application designed to help you manage and master your Kindle vocabulary. It provides an end-to-end workflow, from captured words to ready-to-use flashcards.
 
