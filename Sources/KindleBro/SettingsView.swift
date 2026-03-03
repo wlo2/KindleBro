@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     @AppStorage("autoMasterOnCopy") private var autoMasterOnCopy = true
@@ -13,10 +14,16 @@ struct SettingsView: View {
     @AppStorage("openaiModel") private var openaiModel: String = "gpt-4o"
     @AppStorage("geminiModel") private var geminiModel: String = "gemini-2.0-flash"
     
+    // Backup Settings
+    @AppStorage("backupEnabled") private var backupEnabled = false
+    @AppStorage("backupLocation") private var backupLocation = ""
+    
     @State private var localAutoMaster = true
     @State private var localEnableCompletedBooks = true
     @State private var localEnableRelatedWords = true
     @State private var localEnableStemSearch = true
+    @State private var localBackupEnabled = false
+    @State private var localBackupLocation = ""
     @State private var localOpenAIKey = ""
     @State private var localGeminiKey = ""
     @State private var localProvider: LLMProvider = .openai
@@ -40,6 +47,37 @@ struct SettingsView: View {
                         .toggleStyle(.checkbox)
                     Toggle("Enable stem-based search", isOn: $localEnableStemSearch)
                         .toggleStyle(.checkbox)
+                }
+                
+                Section("Database Backup") {
+                    Toggle("Enable Automatic Backup on Exit", isOn: $localBackupEnabled)
+                        .toggleStyle(.checkbox)
+                    
+                    HStack {
+                        Text("Backup Location:")
+                        Spacer()
+                        if localBackupLocation.isEmpty {
+                            Text("Not Set")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text(URL(fileURLWithPath: localBackupLocation).lastPathComponent)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(localBackupLocation)
+                        }
+                        Button("Select...") {
+                            selectBackupLocation()
+                        }
+                    }
+                    if !localBackupLocation.isEmpty && localBackupEnabled {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("A full backup will be created immediately upon saving if settings changed.")
+                            Text("Incremental updates will be performed automatically every time the app is closed.")
+                                .bold()
+                        }
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    }
                 }
                 
                 Section("AI Provider") {
@@ -127,6 +165,17 @@ struct SettingsView: View {
                     openaiModel = localOpenAIModel
                     geminiModel = localGeminiModel
                     
+                    let locationChanged = localBackupLocation != backupLocation
+                    let backupEnabledChanged = localBackupEnabled != backupEnabled
+                    
+                    backupEnabled = localBackupEnabled
+                    backupLocation = localBackupLocation
+                    
+                    // Trigger immediate backup if enabled and location set, and either setting changed
+                    if localBackupEnabled && !localBackupLocation.isEmpty && (locationChanged || backupEnabledChanged) {
+                        try? DatabaseManager.shared.backup(to: URL(fileURLWithPath: localBackupLocation))
+                    }
+                    
                     // Update OpenAI Key
                     if localOpenAIKey != "****************" {
                         openAIApiKey = localOpenAIKey
@@ -144,7 +193,7 @@ struct SettingsView: View {
             }
             .padding()
         }
-        .frame(width: 500, height: 520)
+        .frame(width: 500, height: 700)
         .onAppear {
             localAutoMaster = autoMasterOnCopy
             localEnableCompletedBooks = enableCompletedBooks
@@ -153,9 +202,25 @@ struct SettingsView: View {
             localProvider = activeProvider
             localOpenAIModel = openaiModel
             localGeminiModel = geminiModel
+            localBackupEnabled = backupEnabled
+            localBackupLocation = backupLocation
             localOpenAIKey = openAIApiKey.isEmpty ? "" : "****************"
             localGeminiKey = geminiApiKey.isEmpty ? "" : "****************"
             fetchModels()
+        }
+    }
+    
+    private func selectBackupLocation() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [UTType(filenameExtension: "sqlite") ?? .database, .database]
+        panel.nameFieldStringValue = "KindleBro_Backup.sqlite"
+        panel.canCreateDirectories = true
+        panel.title = "Select Backup Location"
+        
+        if panel.runModal() == .OK {
+            if let url = panel.url {
+                localBackupLocation = url.path
+            }
         }
     }
     

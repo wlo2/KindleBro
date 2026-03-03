@@ -175,51 +175,62 @@ test>>**translation1**, translation2, translation3 `Usage example`
     
     @ViewBuilder
     private var detailView: some View {
-        ZStack {
-            if !dbManager.isDatabaseLoaded {
-                ContentUnavailableView("Library Empty", systemImage: "books.vertical", description: Text("Import a vocab.db file to get started."))
-                    .toolbar { Button("Import", action: { showImportPicker = true }) }
-            } else {
-                WordListView(
-                    dbManager: dbManager,
-                    selectedWordIds: $selectedWordIds,
-                    searchText: searchText,
-                    scrollRequest: $scrollRequest,
-                    lastScrolledId: $lastScrolledId,
-                    onStatusUpdate: { dbManager.updateStatus(word: $0, newStatus: $1, bulkIds: selectedWordIds) },
-                    onToast: { showToast(message: $0, duration: $1) },
-                    onBulkCopy: handleBulkCopy,
-                    onJumpToWord: handleJumpToWord,
-                    enableRelatedWords: enableRelatedWords,
-                    onSelectAll: handleSelectAll,
-                    onCopyAll: handleCopyAll
-                )
-                .navigationTitle(!searchText.isEmpty ? "Results" : (selectedBook?.title ?? "All Words"))
-                .searchable(text: $searchText, prompt: "Search words or usage...")
-                .toolbar {
-                    ToolbarItem(placement: .status) { SelectionStatusView(count: selectedWordIds.count, onSelectAll: handleSelectAll, onCopyAll: handleCopyAll) }
-                    ToolbarItem(placement: .automatic) {
-                        ActionToolbar(
-                            dbManager: dbManager,
-                            hasSelection: !selectedWordIds.isEmpty,
-                            onUndo: { dbManager.undoLastAction() },
-                            onRefresh: refreshWords,
-                            onPromptCopy: handlePromptCopy,
-                            onGenerateFlashcards: handleGenerateFlashcards
-                        )
-                    }
-                }
-                .onChange(of: selectedWordIds) { oldValue, newValue in handleSelection(oldValue: oldValue, newValue: newValue) }
-                .onChange(of: dbManager.words) { _, newWords in handleDataLoaded(newWords) }
-                .onCopyCommand { handleCopyCommand() }
-            }
-            if let message = toastMessage { ToastView(message: message) }
-        }
-        .sheet(isPresented: $showPromptEditor) { PromptEditorView(prompt: $customPrompt) }
-        .onChange(of: dbManager.showExportPicker) { _, newValue in handleExportTrigger(newValue) }
+        DetailViewContent(
+            dbManager: dbManager,
+            selectedBook: selectedBook,
+            searchText: $searchText,
+            selectedWordIds: $selectedWordIds,
+            scrollRequest: $scrollRequest,
+            lastScrolledId: $lastScrolledId,
+            toastMessage: toastMessage,
+            customPrompt: $customPrompt,
+            showPromptEditor: $showPromptEditor,
+            enableRelatedWords: enableRelatedWords,
+            onImport: { showImportPicker = true },
+            onStatusUpdate: { dbManager.updateStatus(word: $0, newStatus: $1, bulkIds: selectedWordIds) },
+            onToast: { showToast(message: $0, duration: $1) },
+            onBulkCopy: handleBulkCopy,
+            onJumpToWord: handleJumpToWord,
+            onSelectAll: handleSelectAll,
+            onCopyAll: handleCopyAll,
+            onUndo: { dbManager.undoLastAction() },
+            onRefresh: refreshWords,
+            onPromptCopy: handlePromptCopy,
+            onGenerateFlashcards: handleGenerateFlashcards,
+            onArrowKeyUpdate: handleArrowKeyStatusUpdate
+        )
     }
     
     // MARK: - Handlers
+    
+    private func handleArrowKeyStatusUpdate(to targetStatus: WordStatus) {
+        guard !selectedWordIds.isEmpty else { return }
+        let selectedWords = dbManager.words.filter { selectedWordIds.contains($0.id) }
+        guard !selectedWords.isEmpty else { return }
+        
+        // Group words by their new status to perform efficient batch updates if possible,
+        // though DatabaseManager.updateStatus(words:newStatus:) is already efficient.
+        // Logic:
+        // Right Arrow (target .mastered): .learning -> .mastered, .ignored -> .learning
+        // Left Arrow (target .ignored): .learning -> .ignored, .mastered -> .learning
+        
+        for word in selectedWords {
+            var nextStatus = word.status
+            if targetStatus == .mastered {
+                if word.status == .learning { nextStatus = .mastered }
+                else if word.status == .ignored { nextStatus = .learning }
+            } else if targetStatus == .ignored {
+                if word.status == .learning { nextStatus = .ignored }
+                else if word.status == .mastered { nextStatus = .learning }
+            }
+            
+            if nextStatus != word.status {
+                dbManager.updateStatus(word: word, newStatus: nextStatus)
+            }
+        }
+        
+        showToast(message: "Status toggled for \(selectedWords.count) \(selectedWords.count == 1 ? "word" : "words")", duration: 1.5)
+    }
     
     private func handleOnAppear() {
         if dbManager.isDatabaseLoaded {
@@ -476,6 +487,89 @@ struct ActionToolbar: View {
             Button(action: onRefresh) { Image(systemName: "arrow.clockwise") }.help("Refresh list")
             Button(action: onPromptCopy) { Image(systemName: "text.append") }.help("Copy with prompt").disabled(!hasSelection)
             Button(action: onGenerateFlashcards) { Image(systemName: "sparkles") }.help("Generate flashcards").disabled(!hasSelection)
+        }
+    }
+}
+
+struct DetailViewContent: View {
+    @ObservedObject var dbManager: DatabaseManager
+    let selectedBook: Book?
+    @Binding var searchText: String
+    @Binding var selectedWordIds: Set<Word.ID>
+    @Binding var scrollRequest: UUID?
+    @Binding var lastScrolledId: String?
+    let toastMessage: String?
+    @Binding var customPrompt: String
+    @Binding var showPromptEditor: Bool
+    let enableRelatedWords: Bool
+    
+    let onImport: () -> Void
+    let onStatusUpdate: (Word, WordStatus) -> Void
+    let onToast: (String, TimeInterval) -> Void
+    let onBulkCopy: () -> Void
+    let onJumpToWord: (Word) -> Void
+    let onSelectAll: () -> Void
+    let onCopyAll: () -> Void
+    let onUndo: () -> Void
+    let onRefresh: () -> Void
+    let onPromptCopy: () -> Void
+    let onGenerateFlashcards: () -> Void
+    let onArrowKeyUpdate: (WordStatus) -> Void
+
+    var body: some View {
+        ZStack {
+            if !dbManager.isDatabaseLoaded {
+                ContentUnavailableView("Library Empty", systemImage: "books.vertical", description: Text("Import a vocab.db file to get started."))
+                    .toolbar { Button("Import", action: onImport) }
+            } else {
+                WordListView(
+                    dbManager: dbManager,
+                    selectedWordIds: $selectedWordIds,
+                    searchText: searchText,
+                    scrollRequest: $scrollRequest,
+                    lastScrolledId: $lastScrolledId,
+                    onStatusUpdate: onStatusUpdate,
+                    onToast: onToast,
+                    onBulkCopy: onBulkCopy,
+                    onJumpToWord: onJumpToWord,
+                    enableRelatedWords: enableRelatedWords,
+                    onSelectAll: onSelectAll,
+                    onCopyAll: onCopyAll
+                )
+                .navigationTitle(!searchText.isEmpty ? "Results" : (selectedBook?.title ?? "All Words"))
+                .searchable(text: $searchText, prompt: "Search words or usage...")
+                .toolbar {
+                    ToolbarItem(placement: .status) { SelectionStatusView(count: selectedWordIds.count, onSelectAll: onSelectAll, onCopyAll: onCopyAll) }
+                    ToolbarItem(placement: .automatic) {
+                        ActionToolbar(
+                            dbManager: dbManager,
+                            hasSelection: !selectedWordIds.isEmpty,
+                            onUndo: onUndo,
+                            onRefresh: onRefresh,
+                            onPromptCopy: onPromptCopy,
+                            onGenerateFlashcards: onGenerateFlashcards
+                        )
+                    }
+                }
+                .onCopyCommand {
+                    let t = dbManager.formatSelected(ids: selectedWordIds)
+                    if !t.isEmpty {
+                        onToast("Copied", 2.5)
+                        return [NSItemProvider(object: t as NSString)]
+                    }
+                    return []
+                }
+            }
+            if let message = toastMessage { ToastView(message: message) }
+        }
+        .sheet(isPresented: $showPromptEditor) { PromptEditorView(prompt: $customPrompt) }
+        .onKeyPress(.rightArrow) {
+            onArrowKeyUpdate(.mastered)
+            return .handled
+        }
+        .onKeyPress(.leftArrow) {
+            onArrowKeyUpdate(.ignored)
+            return .handled
         }
     }
 }

@@ -24,7 +24,19 @@ Inspired by [Kindle Mate](https://sourceforge.net/projects/kmate/). Completely f
 > [!note]  
 > Experiments with flashcards containing multiple usages showed that excessive information in a single card reduces retrieval quality. The app therefore limits each word to one preferred usage.
 - When the same word appears in multiple books, its status is shared. Marking a word as `Mastered` updates it across all books.
-- **Undo Support**: Revert status changes if needed.
+- **Undo Support**: Easily revert status changes if you make a mistake.
+- **Automatic Incremental Backup**: Periodically or on app exit, KindleBro can efficiently export your entire library to a designated location (e.g., Dropbox or iCloud Drive) using SQLite's high-performance backup API.
+
+### ⌨️ Keyboard-driven review
+- **Right Arrow**: 
+    - `Learning` → **Mastered**
+    - `Ignored` → **Learning**
+- **Left Arrow**:
+    - `Learning` → **Ignored**
+    - `Mastered` → **Learning**
+- **Cmd + C**: Copy selected words and their primary usage.
+- **Cmd + Shift + P**: Open Prompt Editor.
+- **Cmd + ,**: Open Settings.
 - Each word includes a copy icon for copying the word or its usage separately.
 - Multiple words can be selected using the Command key.
 - Dedicated buttons for:
@@ -34,7 +46,7 @@ Inspired by [Kindle Mate](https://sourceforge.net/projects/kmate/). Completely f
 ### 🔍 Advanced Search & Discovery
 - **Book Title Search**: Quickly filter your book list.
 - **Global Search**: Search across the entire vocabulary library, including both words and contexts.
-    - Stem-based search for English. For example, “peeved” also finds “peeve,” while usage text is matched literally.
+    - Stem-based search for English. For example, «peeved» also finds «peeve», while usage text is matched literally.
 - **Related Words**: Words sharing the same stem across different books are grouped and shown via a red-dot popover, allowing quick navigation. This feature can be disabled in Settings, along with stem-based search.
 ### Library Management
 - `vocab.db` can be imported from any location.
@@ -45,7 +57,7 @@ Inspired by [Kindle Mate](https://sourceforge.net/projects/kmate/). Completely f
 - **Dual AI Provider Support**: Use either **OpenAI** or **Google Gemini** to generate study materials. The model list is fetched dynamically to ensure access to recent models.
 - **Customizable Prompts**: Define your own prompt structure to generate flashcards exactly as required (e.g., Anki, RemNote, or custom formats).
 - **Auto-Mastering**: Optionally mark words as `Mastered` automatically when flashcards are generated or copied with a prompt.
-The default prompt targets RemNote as most advanced SRS system:
+The default prompt targets [RemNote](https://www.remnote.com/) as most advanced SRS system:
 ```
 For a given set of words and usage samples, generate RemNote flashcards in the following format:
 
@@ -63,7 +75,7 @@ After testing various free models, `Gemini-3-Flash` currently produces the most 
 #### LLM usage for flashcard generation
 I was initially opposed to using LLMs for flashcard generation due to the relatively high error rate, and because writing cards manually improves retention.
 
-However, models have improved significantly. Translation hallucinations are now rare, and proper prompt engineering reduces the error rate further. In particular, including usage examples gives the model enough context to choose more accurate translations.
+However, models have improved significantly. Translation hallucinations are now very rare, and proper prompt engineering reduces the error rate further. In particular, including usage examples gives the model enough context to choose more accurate translations.
 
 Even assuming occasional errors, LLM output should be compared to traditional dictionary lookup. In practice, LLM-based generation is significantly faster, which can justify a small number of imperfect cards in large batches.
 
@@ -92,4 +104,4 @@ Assuming initial setup is complete:
 
 ---
 
-_"Turn every book you read into a library of knowledge you'll never forget."_ — Gemini 3 Flash
+_«Turn every book you read into a library of knowledge you'll never forget.»_ — Gemini 3 Flash

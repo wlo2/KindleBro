@@ -1,6 +1,7 @@
 import Foundation
 import NaturalLanguage
 import SQLite
+import SQLite3
 
 class DatabaseManager: ObservableObject {
     static let shared = DatabaseManager()
@@ -140,6 +141,46 @@ class DatabaseManager: ObservableObject {
             }
             print("Failed to open database: \(error)")
         }
+    }
+    
+    func backup(to targetURL: URL) throws {
+        guard let sourceHandle = db?.handle else {
+            throw AppError.dbError("Database not loaded")
+        }
+        
+        let destDb: Connection
+        do {
+            destDb = try Connection(targetURL.path)
+        } catch {
+            throw AppError.dbError("Failed to open destination database: \(error)")
+        }
+        
+        let destHandle = destDb.handle
+        
+        // sqlite3_backup_init(pDest, zDestName, pSource, zSourceName)
+        // zDestName and zSourceName are usually "main"
+        guard let backup = sqlite3_backup_init(destHandle, "main", sourceHandle, "main") else {
+            let errorMsg = String(cString: sqlite3_errmsg(destHandle))
+            throw AppError.dbError("Backup initialization failed: \(errorMsg)")
+        }
+        
+        // sqlite3_backup_step(p, nPage)
+        // -1 means copy all pages
+        let stepResult = sqlite3_backup_step(backup, -1)
+        
+        // sqlite3_backup_finish(p)
+        let finishResult = sqlite3_backup_finish(backup)
+        
+        if stepResult != SQLITE_DONE {
+            let errorMsg = String(cString: sqlite3_errmsg(destHandle))
+            throw AppError.dbError("Backup step failed (\(stepResult)): \(errorMsg)")
+        }
+        
+        if finishResult != SQLITE_OK {
+            throw AppError.dbError("Backup finish failed (\(finishResult))")
+        }
+        
+        print("Backup successful to: \(targetURL.path)")
     }
     
     private func createIndices() throws {
