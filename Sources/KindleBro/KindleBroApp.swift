@@ -51,11 +51,15 @@ private struct AboutWindow: View {
                 .font(.title2)
                 .bold()
             
-            Text("Version \(version)")
+            Text("Version 1.0")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             
-            Text("gggggBBbbbBBBBBJEEEEDDDDDdddddddddddDDDDDDDDD Industries 2026")
+            Link("GitHub", destination: URL(string: "https://github.com/wlo2/KindleBro")!)
+                .font(.subheadline)
+                .foregroundStyle(.blue)
+            
+            Text("gggggJJJJJJJJJJJJJEEEEEEEBBBBbbbBDDDDDDDDdddddddDDDDT Industries 2026")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -82,14 +86,24 @@ test>>**translation1**, translation2, translation3 `Usage example`
     }
 }
 
-@main
+    @main
 struct KindleBroApp: App {
     let dbManager = DatabaseManager.shared
+    
+    // Backup settings
+    @AppStorage("backupEnabled") private var backupEnabled = false
+    @AppStorage("backupLocation") private var backupLocation = ""
     
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environmentObject(dbManager)
+                .onReceive(NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)) { _ in
+                    if backupEnabled && !backupLocation.isEmpty {
+                        print("App terminating, triggered automatic backup...")
+                        try? dbManager.backup(to: URL(fileURLWithPath: backupLocation))
+                    }
+                }
         }
         .commands {
             AppMenuCommands(dbManager: dbManager)
