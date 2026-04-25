@@ -37,7 +37,7 @@ private struct AboutWindow: View {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "KindleBro"
     }
     private var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.1"
     }
     
     var body: some View {
@@ -51,7 +51,7 @@ private struct AboutWindow: View {
                 .font(.title2)
                 .bold()
             
-            Text("Version 1.0")
+            Text("Version \(version)")
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
             

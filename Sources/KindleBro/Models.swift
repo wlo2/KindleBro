@@ -6,7 +6,15 @@ struct Book: Identifiable, Hashable {
     let authors: String
     let language: String
     var wordCount: Int = 0
+    var learningWordCount: Int = 0
     var isMastered: Bool = false
+
+    var sidebarCountText: String {
+        if !isMastered && learningWordCount < wordCount {
+            return "\(learningWordCount)/\(wordCount)"
+        }
+        return "\(wordCount)"
+    }
 }
 
 struct WordUsage: Identifiable, Hashable {
@@ -21,8 +29,10 @@ struct WordUsage: Identifiable, Hashable {
 
 struct Word: Identifiable, Hashable {
     let id: String // Unique identifier for SwiftUI (e.g., wordId_bookTitleHash)
-    let databaseId: String // Original WORDS.id for database updates
-    let text: String
+    var databaseId: String // Original WORDS.id for database updates
+    var databaseIds: [String] = []
+    var databaseStatuses: [String: WordStatus] = [:]
+    var text: String
     let stem: String?
     let language: String
     var status: WordStatus
@@ -32,7 +42,7 @@ struct Word: Identifiable, Hashable {
     let bookId: String? // From BOOK_INFO
     let bookTitle: String? // From BOOK_INFO
     let bookAuthors: String? // From BOOK_INFO
-    let timestamp: Int64 // Primary timestamp (often the latest)
+    var timestamp: Int64 // Primary timestamp (often the latest)
     var stemOtherBookCount: Int = 0 // Count of other books sharing the same stem
     
     var date: Date {

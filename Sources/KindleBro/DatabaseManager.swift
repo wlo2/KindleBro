@@ -292,45 +292,58 @@ class DatabaseManager: ObservableObject {
                     B.title,
                     B.authors,
                     B.lang,
-                    COUNT(DISTINCT W.word) AS word_count,
-                    SUM(CASE WHEN W.category = 0 THEN 1 ELSE 0 END) AS learning_count
+                    W.word,
+                    W.lang,
+                    W.category
                 FROM BOOK_INFO B
                 JOIN LOOKUPS L ON L.book_key = B.id
                 JOIN WORDS W ON W.id = L.word_key
-                GROUP BY B.id
                 """
                 
                 var bookMap: [String: Book] = [:]
+                var normalizedStatusesByBook: [String: [String: Set<WordStatus>]] = [:]
                 
                 for row in try db.prepare(sql) {
                     let id = row[0] as! String
                     let title = row[1] as! String
                     let authors = row[2] as! String
                     let lang = row[3] as! String
-                    let count = Int(row[4] as! Int64)
-                    let learningCount = Int(row[5] as! Int64)
+                    let word = row[4] as! String
+                    let wordLanguage = row[5] as! String
+                    let category = Int(row[6] as! Int64)
+                    let status = WordStatus(rawValue: category) ?? .learning
                     
                     // Use a key to aggregate duplicates (Title + Authors)
                     let bookKey = "\(title)_\(authors)"
+                    let normalizedWordKey = self.normalizedBookWordKey(text: word, language: wordLanguage)
                     
-                    if count > 0 {
-                        if var existing = bookMap[bookKey] {
-                            existing.wordCount += count
-                            if learningCount > 0 {
-                                existing.isMastered = false
-                            }
-                            bookMap[bookKey] = existing
-                        } else {
-                            bookMap[bookKey] = Book(
-                                id: id,
-                                title: title,
-                                authors: authors,
-                                language: lang,
-                                wordCount: count,
-                                isMastered: learningCount == 0
-                            )
-                        }
+                    if bookMap[bookKey] == nil {
+                        bookMap[bookKey] = Book(
+                            id: id,
+                            title: title,
+                            authors: authors,
+                            language: lang,
+                            wordCount: 0,
+                            learningWordCount: 0,
+                            isMastered: true
+                        )
                     }
+
+                    var perBook = normalizedStatusesByBook[bookKey] ?? [:]
+                    var statuses = perBook[normalizedWordKey] ?? Set<WordStatus>()
+                    statuses.insert(status)
+                    perBook[normalizedWordKey] = statuses
+                    normalizedStatusesByBook[bookKey] = perBook
+                }
+
+                for (bookKey, statusesByWord) in normalizedStatusesByBook {
+                    guard var book = bookMap[bookKey] else { continue }
+                    book.wordCount = statusesByWord.count
+                    book.learningWordCount = statusesByWord.values.contains(where: { $0.contains(.learning) })
+                        ? statusesByWord.values.reduce(0) { $0 + ($1.contains(.learning) ? 1 : 0) }
+                        : 0
+                    book.isMastered = book.learningWordCount == 0
+                    bookMap[bookKey] = book
                 }
                 
                 let sortedBooks = bookMap.values.sorted(by: { $0.title < $1.title })
@@ -399,6 +412,120 @@ class DatabaseManager: ObservableObject {
             return []
         }
         return englishStemCandidates(for: text)
+    }
+
+    private func isEnglishLanguage(_ language: String?) -> Bool {
+        guard let language else { return false }
+        let lower = language.lowercased()
+        return lower == "en" || lower.hasPrefix("en-") || lower == "english"
+    }
+
+    private func normalizedBookWordKey(text: String, language: String?) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lower = trimmed.lowercased()
+
+        guard isEnglishLanguage(language),
+              trimmed.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
+              trimmed.range(of: "[A-Za-z]", options: .regularExpression) != nil,
+              lower.hasSuffix("s") else {
+            return lower
+        }
+
+        let tagger = NLTagger(tagSchemes: [.lemma, .lexicalClass])
+        tagger.string = trimmed
+        let (lemmaTag, _) = tagger.tag(at: trimmed.startIndex, unit: .word, scheme: .lemma)
+        let (classTag, _) = tagger.tag(at: trimmed.startIndex, unit: .word, scheme: .lexicalClass)
+
+        guard classTag == .noun,
+              let lemma = lemmaTag?.rawValue.lowercased(),
+              !lemma.isEmpty,
+              lemma != lower else {
+            return lower
+        }
+
+        return lemma
+    }
+
+    private func mergedStatus(from statuses: [WordStatus]) -> WordStatus {
+        if statuses.contains(.learning) { return .learning }
+        if statuses.contains(.mastered) { return .mastered }
+        return .ignored
+    }
+
+    private func mergeCaseVariants(_ words: [Word], preferredUsages: [String: String]) -> [Word] {
+        var merged: [String: Word] = [:]
+        var order: [String] = []
+
+        for word in words {
+            let normalizedKey = normalizedBookWordKey(text: word.text, language: word.language)
+            let groupKey = "\(word.bookId ?? "")|\(normalizedKey)"
+            if merged[groupKey] == nil {
+                var seed = word
+                seed.text = normalizedKey
+                seed.databaseIds = word.databaseIds.isEmpty ? [word.databaseId] : word.databaseIds
+                seed.databaseStatuses = word.databaseStatuses.isEmpty ? [word.databaseId: word.status] : word.databaseStatuses
+                seed.allUsages = word.allUsages
+                seed.usageCount = word.usageCount
+                seed.status = mergedStatus(from: Array(seed.databaseStatuses.values))
+                seed.usage = preferredUsages[seed.databaseId] ?? word.usage
+                merged[groupKey] = seed
+                order.append(groupKey)
+                continue
+            }
+
+            var current = merged[groupKey]!
+            let incomingIds = word.databaseIds.isEmpty ? [word.databaseId] : word.databaseIds
+            for id in incomingIds where !current.databaseIds.contains(id) {
+                current.databaseIds.append(id)
+            }
+
+            let incomingStatuses = word.databaseStatuses.isEmpty ? [word.databaseId: word.status] : word.databaseStatuses
+            for (id, status) in incomingStatuses {
+                current.databaseStatuses[id] = status
+            }
+
+            current.text = normalizedKey
+            if normalizedKey == word.text.lowercased() {
+                current.databaseId = word.databaseId
+            }
+
+            if word.timestamp > current.timestamp {
+                current.timestamp = word.timestamp
+                current.usage = preferredUsages[current.databaseId] ?? word.usage
+            }
+
+            current.usageCount += word.usageCount
+            current.stemOtherBookCount = max(current.stemOtherBookCount, word.stemOtherBookCount)
+
+            for usage in word.allUsages where !current.allUsages.contains(usage) {
+                current.allUsages.append(usage)
+            }
+
+            let preferredUsage = current.databaseIds.compactMap { preferredUsages[$0] }.first
+            if let preferredUsage {
+                current.usage = preferredUsage
+            }
+
+            current.status = mergedStatus(from: Array(current.databaseStatuses.values))
+            merged[groupKey] = current
+        }
+
+        return order.compactMap { merged[$0] }.sorted {
+            let lhsOrder: Int
+            switch $0.status {
+            case .learning: lhsOrder = 0
+            case .mastered: lhsOrder = 1
+            case .ignored: lhsOrder = 2
+            }
+            let rhsOrder: Int
+            switch $1.status {
+            case .learning: rhsOrder = 0
+            case .mastered: rhsOrder = 1
+            case .ignored: rhsOrder = 2
+            }
+            if lhsOrder != rhsOrder { return lhsOrder < rhsOrder }
+            return $0.timestamp > $1.timestamp
+        }
     }
     
     func fetchWords(for bookId: String?, search: String = "") {
@@ -598,7 +725,7 @@ class DatabaseManager: ObservableObject {
                     sql += " LIMIT 1000"
                 }
                 
-                var finalWords: [Word] = []
+                var rawWords: [Word] = []
                 
                 for row in try db.prepare(sql) {
                     if workItem.isCancelled { return }
@@ -617,11 +744,13 @@ class DatabaseManager: ObservableObject {
                     
                     let status = WordStatus(rawValue: cat) ?? .learning
                     let preferred = preferredUsages[id]
-                    let uiId = "\(id)_\(bId)"
+                    let uiId = "\(self.normalizedBookWordKey(text: text, language: lang))_\(bId)"
                     
                     let newWord = Word(
                         id: uiId,
                         databaseId: id,
+                        databaseIds: [id],
+                        databaseStatuses: [id: status],
                         text: text,
                         stem: stem,
                         language: lang,
@@ -635,8 +764,10 @@ class DatabaseManager: ObservableObject {
                         timestamp: ts,
                         stemOtherBookCount: stemOtherBookCount
                     )
-                    finalWords.append(newWord)
+                    rawWords.append(newWord)
                 }
+
+                let finalWords = self.mergeCaseVariants(rawWords, preferredUsages: preferredUsages)
                 
                 DispatchQueue.main.async {
                     if !workItem.isCancelled {
@@ -660,10 +791,13 @@ class DatabaseManager: ObservableObject {
         guard let db = db, let bookId = word.bookId else { return }
         dbQueue.async {
             do {
+                let targetIds = word.databaseIds.isEmpty ? [word.databaseId] : word.databaseIds
+                let quotedIds = targetIds.map { "'\($0.replacingOccurrences(of: "'", with: "''"))'" }.joined(separator: ", ")
+                let safeBookId = bookId.replacingOccurrences(of: "'", with: "''")
                 let sql = """
                 SELECT L.usage, L.timestamp
                 FROM LOOKUPS L
-                WHERE L.word_key = '\(word.databaseId)' AND L.book_key = '\(bookId)'
+                WHERE L.word_key IN (\(quotedIds)) AND L.book_key = '\(safeBookId)'
                 ORDER BY L.timestamp DESC
                 """
                 
@@ -774,11 +908,13 @@ class DatabaseManager: ObservableObject {
                     let usageCount = Int(row[10] as! Int64)
 
                     let status = WordStatus(rawValue: cat) ?? .learning
-                    let uiId = "\(id)_\(bId)"
+                    let uiId = "\(self.normalizedBookWordKey(text: text, language: lang))_\(bId)"
 
                     results.append(Word(
                         id: uiId,
                         databaseId: id,
+                        databaseIds: [id],
+                        databaseStatuses: [id: status],
                         text: text,
                         stem: stem,
                         language: lang,
@@ -795,7 +931,7 @@ class DatabaseManager: ObservableObject {
                 }
 
                 DispatchQueue.main.async {
-                    completion(results)
+                    completion(self.mergeCaseVariants(results, preferredUsages: [:]))
                 }
             } catch {
                 print("Error fetching stem matches: \(error)")
@@ -810,7 +946,9 @@ class DatabaseManager: ObservableObject {
     
     func updateStatus(words: [Word], newStatus: WordStatus, underscore: Bool = true) {
         // Capture old statuses for undo
-        let changes = words.map { ($0.databaseId, $0.status) }
+        let changes = words.flatMap { word in
+            word.databaseStatuses.map { ($0.key, $0.value) }
+        }
         if underscore {
             undoStack.append(UndoAction(changes: changes))
         }
@@ -818,7 +956,7 @@ class DatabaseManager: ObservableObject {
         guard let db = db else { return }
         
         let newCategory = newStatus.rawValue
-        let dbIds = words.map { $0.databaseId }
+        let dbIds = Array(Set(words.flatMap { $0.databaseIds.isEmpty ? [$0.databaseId] : $0.databaseIds }))
         let uiIds = words.map { $0.id }
         
         dbQueue.async { [weak self] in
@@ -833,6 +971,9 @@ class DatabaseManager: ObservableObject {
                         if uiIds.contains(w.id) {
                             var updatedWord = w
                             updatedWord.status = newStatus
+                            for id in updatedWord.databaseIds.isEmpty ? [updatedWord.databaseId] : updatedWord.databaseIds {
+                                updatedWord.databaseStatuses[id] = newStatus
+                            }
                             self.words[i] = updatedWord
                         }
                     }
@@ -869,9 +1010,13 @@ class DatabaseManager: ObservableObject {
                     let idToStatus = Dictionary(uniqueKeysWithValues: lastAction.changes)
                     
                     for (i, w) in self.words.enumerated() {
-                        if let restoredStatus = idToStatus[w.databaseId] {
+                        let matchedIds = (w.databaseIds.isEmpty ? [w.databaseId] : w.databaseIds).filter { idToStatus[$0] != nil }
+                        if !matchedIds.isEmpty {
                             var updatedWord = w
-                            updatedWord.status = restoredStatus
+                            for id in matchedIds {
+                                updatedWord.databaseStatuses[id] = idToStatus[id]
+                            }
+                            updatedWord.status = self.mergedStatus(from: Array(updatedWord.databaseStatuses.values))
                             self.words[i] = updatedWord
                         }
                     }
@@ -894,7 +1039,8 @@ class DatabaseManager: ObservableObject {
         // Update local memory immediately if possible
         // We look for any word instance with this databaseId
         for i in words.indices {
-            if words[i].databaseId == wordId {
+            let ids = words[i].databaseIds.isEmpty ? [words[i].databaseId] : words[i].databaseIds
+            if ids.contains(wordId) {
                 var updatedWord = words[i]
                 updatedWord.usage = usage
                 words[i] = updatedWord
