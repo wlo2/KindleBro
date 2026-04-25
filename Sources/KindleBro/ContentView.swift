@@ -1,7 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-private let sidebarTrailingColumnWidth: CGFloat = 30
+private let sidebarTrailingColumnWidth: CGFloat = 56
 private let sidebarTrailingColumnPadding: CGFloat = 8
 private let sidebarHeaderTrailingInset: CGFloat = 12
 
@@ -71,6 +71,12 @@ test>>**translation1**, translation2, translation3 `Usage example`
         }
         .onChange(of: selectedBook) { _, _ in handleBookChange() }
         .onChange(of: searchText) { _, _ in handleSearchChange() }
+        .onChange(of: selectedWordIds) { oldValue, newValue in
+            handleSelection(oldValue: oldValue, newValue: newValue)
+        }
+        .onChange(of: dbManager.words) { _, newValue in
+            handleDataLoaded(newValue)
+        }
         .onChange(of: customPrompt) { _, newValue in
             dbManager.saveSetting(key: "customPrompt", value: newValue)
         }
@@ -411,7 +417,7 @@ struct BookRow: View {
                 Text(book.authors).font(.caption).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer()
-            Text("\(book.wordCount)")
+            Text(book.sidebarCountText)
                 .foregroundStyle(.secondary)
                 .font(.caption)
                 .frame(width: sidebarTrailingColumnWidth, alignment: .trailing)

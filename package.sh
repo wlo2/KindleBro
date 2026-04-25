@@ -6,6 +6,7 @@ APP_BUNDLE="${APP_NAME}.app"
 DMG_NAME="${APP_NAME}.dmg"
 ICON_SRC="icon.png"
 ICON_NAME="AppIcon"
+SRGB_PROFILE="/System/Library/ColorSync/Profiles/sRGB Profile.icc"
 
 # 1. Build
 echo "Building..."
@@ -34,16 +35,27 @@ if [ -f "$ICON_SRC" ]; then
     ICONSET_DIR="$(mktemp -d)/${ICON_NAME}.iconset"
     mkdir -p "$ICONSET_DIR"
 
-    sips -s format png -z 16 16     "$ICON_SRC" --out "${ICONSET_DIR}/icon_16x16.png" >/dev/null
-    sips -s format png -z 32 32     "$ICON_SRC" --out "${ICONSET_DIR}/icon_16x16@2x.png" >/dev/null
-    sips -s format png -z 32 32     "$ICON_SRC" --out "${ICONSET_DIR}/icon_32x32.png" >/dev/null
-    sips -s format png -z 64 64     "$ICON_SRC" --out "${ICONSET_DIR}/icon_32x32@2x.png" >/dev/null
-    sips -s format png -z 128 128   "$ICON_SRC" --out "${ICONSET_DIR}/icon_128x128.png" >/dev/null
-    sips -s format png -z 256 256   "$ICON_SRC" --out "${ICONSET_DIR}/icon_128x128@2x.png" >/dev/null
-    sips -s format png -z 256 256   "$ICON_SRC" --out "${ICONSET_DIR}/icon_256x256.png" >/dev/null
-    sips -s format png -z 512 512   "$ICON_SRC" --out "${ICONSET_DIR}/icon_256x256@2x.png" >/dev/null
-    sips -s format png -z 512 512   "$ICON_SRC" --out "${ICONSET_DIR}/icon_512x512.png" >/dev/null
-    sips -s format png -z 1024 1024 "$ICON_SRC" --out "${ICONSET_DIR}/icon_512x512@2x.png" >/dev/null
+    # Keep the source image as the highest-resolution icon to avoid an extra re-encode.
+    cp "$ICON_SRC" "${ICONSET_DIR}/icon_512x512@2x.png"
+    if [ -f "$SRGB_PROFILE" ]; then
+        sips --matchTo "$SRGB_PROFILE" "${ICONSET_DIR}/icon_512x512@2x.png" >/dev/null
+    fi
+
+    sips -z 16 16     "${ICONSET_DIR}/icon_512x512@2x.png" --out "${ICONSET_DIR}/icon_16x16.png" >/dev/null
+    sips -z 32 32     "${ICONSET_DIR}/icon_512x512@2x.png" --out "${ICONSET_DIR}/icon_16x16@2x.png" >/dev/null
+    sips -z 32 32     "${ICONSET_DIR}/icon_512x512@2x.png" --out "${ICONSET_DIR}/icon_32x32.png" >/dev/null
+    sips -z 64 64     "${ICONSET_DIR}/icon_512x512@2x.png" --out "${ICONSET_DIR}/icon_32x32@2x.png" >/dev/null
+    sips -z 128 128   "${ICONSET_DIR}/icon_512x512@2x.png" --out "${ICONSET_DIR}/icon_128x128.png" >/dev/null
+    sips -z 256 256   "${ICONSET_DIR}/icon_512x512@2x.png" --out "${ICONSET_DIR}/icon_128x128@2x.png" >/dev/null
+    sips -z 256 256   "${ICONSET_DIR}/icon_512x512@2x.png" --out "${ICONSET_DIR}/icon_256x256.png" >/dev/null
+    sips -z 512 512   "${ICONSET_DIR}/icon_512x512@2x.png" --out "${ICONSET_DIR}/icon_256x256@2x.png" >/dev/null
+    sips -z 512 512   "${ICONSET_DIR}/icon_512x512@2x.png" --out "${ICONSET_DIR}/icon_512x512.png" >/dev/null
+
+    if [ -f "$SRGB_PROFILE" ]; then
+        for icon_file in "${ICONSET_DIR}"/*.png; do
+            sips --matchTo "$SRGB_PROFILE" "$icon_file" >/dev/null
+        done
+    fi
 
     iconutil -c icns "$ICONSET_DIR" -o "${APP_BUNDLE}/Contents/Resources/${ICON_NAME}.icns"
     # Nudge Finder to refresh the app icon cache

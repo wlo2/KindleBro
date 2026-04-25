@@ -18,6 +18,7 @@ Inspired by [Kindle Mate](https://sourceforge.net/projects/kmate/). Completely f
     - `Ignored` — for erroneously added words (there is no way to remove words from `vocab.db` on Kindle).
     - `Mastered` — for processed words with created flashcards.
 - The goal is to process all words. When all words in a book are set to `Mastered` or `Ignored`, the book is marked as `Completed` and moved to the **Completed** section. This separates in-progress books from finished ones.
+- In-progress books show `Learning/Total` in the sidebar count, making it easier to track what is left to review at a glance.
 - With **Refresh** button, `Completed` and `Ignored` words are moved to the bottom of the list to simplify batch processing in word-dense books.
 - Each word includes its usage (the context sentence from the book). Context is critical for retrieval. If a word has multiple usages within the same book, a chevron appears, allowing you to select the preferred usage for subsequent processing.
 
