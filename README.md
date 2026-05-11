@@ -41,6 +41,7 @@ Inspired by [Kindle Mate](https://sourceforge.net/projects/kmate/). Completely f
 - Each word includes a copy icon for copying the word or its usage separately.
 - Multiple words can be selected using the Command key.
 - Dedicated buttons for:
+    - `Select learning batch` — selects the first configurable batch of `Learning` words in the current book.
     - `Select all Learning words`
     - `Copy all Learning words`
     - `Copy selected words with prompt`

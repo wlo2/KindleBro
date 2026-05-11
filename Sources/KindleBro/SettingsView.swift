@@ -1,11 +1,63 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+private struct LearningBatchSizeRow: View {
+    @Binding var value: Int
+    @Binding var text: String
+
+    var body: some View {
+        HStack {
+            Text("Learning batch size")
+            Spacer()
+            HStack(spacing: 4) {
+                TextField("", text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 68)
+                    .onChange(of: text) { _, newValue in
+                        let digits = newValue.filter(\.isNumber)
+                        if digits != newValue {
+                            text = digits
+                            return
+                        }
+                        if digits.isEmpty {
+                            return
+                        }
+                        if let parsed = Int(digits), parsed > 0 {
+                            value = min(parsed, 500)
+                        }
+                    }
+
+                Button(action: {
+                    value = max(1, value - 1)
+                    text = "\(value)"
+                }) {
+                    Image(systemName: "minus")
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+
+                Button(action: {
+                    value = min(500, value + 1)
+                    text = "\(value)"
+                }) {
+                    Image(systemName: "plus")
+                        .frame(width: 28, height: 28)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.borderless)
+            }
+        }
+    }
+}
+
 struct SettingsView: View {
     @AppStorage("autoMasterOnCopy") private var autoMasterOnCopy = true
     @AppStorage("enableCompletedBooks") private var enableCompletedBooks = true
     @AppStorage("enableRelatedWords") private var enableRelatedWords = true
     @AppStorage("enableStemSearch") private var enableStemSearch = true
+    @AppStorage("learningBatchSize") private var learningBatchSize = 15
     @AppStorage("openAIKey") private var openAIApiKey = ""
     @AppStorage("geminiKey") private var geminiApiKey = ""
     
@@ -22,6 +74,8 @@ struct SettingsView: View {
     @State private var localEnableCompletedBooks = true
     @State private var localEnableRelatedWords = true
     @State private var localEnableStemSearch = true
+    @State private var localLearningBatchSize = 15
+    @State private var localLearningBatchSizeText = "15"
     @State private var localBackupEnabled = false
     @State private var localBackupLocation = ""
     @State private var localOpenAIKey = ""
@@ -47,6 +101,10 @@ struct SettingsView: View {
                         .toggleStyle(.checkbox)
                     Toggle("Enable stem-based search", isOn: $localEnableStemSearch)
                         .toggleStyle(.checkbox)
+                    LearningBatchSizeRow(
+                        value: $localLearningBatchSize,
+                        text: $localLearningBatchSizeText
+                    )
                 }
                 
                 Section("Database Backup") {
@@ -161,6 +219,7 @@ struct SettingsView: View {
                     enableCompletedBooks = localEnableCompletedBooks
                     enableRelatedWords = localEnableRelatedWords
                     enableStemSearch = localEnableStemSearch
+                    learningBatchSize = max(1, min(localLearningBatchSize, 500))
                     activeProvider = localProvider
                     openaiModel = localOpenAIModel
                     geminiModel = localGeminiModel
@@ -199,6 +258,8 @@ struct SettingsView: View {
             localEnableCompletedBooks = enableCompletedBooks
             localEnableRelatedWords = enableRelatedWords
             localEnableStemSearch = enableStemSearch
+            localLearningBatchSize = learningBatchSize
+            localLearningBatchSizeText = "\(learningBatchSize)"
             localProvider = activeProvider
             localOpenAIModel = openaiModel
             localGeminiModel = geminiModel

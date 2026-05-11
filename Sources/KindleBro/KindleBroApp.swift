@@ -37,7 +37,7 @@ private struct AboutWindow: View {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "KindleBro"
     }
     private var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.1"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.2"
     }
     
     var body: some View {

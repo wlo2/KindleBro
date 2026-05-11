@@ -36,6 +36,7 @@ test>>**translation1**, translation2, translation3 `Usage example`
     @AppStorage("enableCompletedBooks") private var enableCompletedBooks = true
     @AppStorage("enableRelatedWords") private var enableRelatedWords = true
     @AppStorage("enableStemSearch") private var enableStemSearch = true
+    @AppStorage("learningBatchSize") private var learningBatchSize = 15
     
     // Session Restoration
     @AppStorage("lastSelectedBookId") private var lastSelectedBookId: String = ""
@@ -197,6 +198,7 @@ test>>**translation1**, translation2, translation3 `Usage example`
             onToast: { showToast(message: $0, duration: $1) },
             onBulkCopy: handleBulkCopy,
             onJumpToWord: handleJumpToWord,
+            onSelectBatch: handleSelectLearningBatch,
             onSelectAll: handleSelectAll,
             onCopyAll: handleCopyAll,
             onUndo: { dbManager.undoLastAction() },
@@ -350,6 +352,16 @@ test>>**translation1**, translation2, translation3 `Usage example`
             if autoMasterOnCopy { dbManager.masterAllLearning() }
         } else { showToast(message: "No words to copy", duration: 2.5) }
     }
+
+    private func handleSelectLearningBatch() {
+        let batchSize = max(1, learningBatchSize)
+        let ids = dbManager.learningWordIds(limit: batchSize)
+        if !ids.isEmpty {
+            selectedWordIds = Set(ids)
+        } else {
+            showToast(message: "No words to select", duration: 2.5)
+        }
+    }
     
     private func handleSelectAll() { selectedWordIds = Set(dbManager.words.filter { $0.status == .learning }.map { $0.id }) }
     
@@ -474,10 +486,11 @@ struct WordListView: View {
 }
 
 struct SelectionStatusView: View {
-    let count: Int; let onSelectAll: () -> Void; let onCopyAll: () -> Void
+    let count: Int; let onSelectBatch: () -> Void; let onSelectAll: () -> Void; let onCopyAll: () -> Void
     var body: some View {
         if count > 1 { Text("\(count) selected").foregroundStyle(.secondary).font(.caption).padding(.horizontal, 8) }
         else { HStack(spacing: 12) {
+            Button(action: onSelectBatch) { Image(systemName: "checkmark.circle") }.help("Select learning batch")
             Button(action: onSelectAll) { Image(systemName: "checklist") }.help("Select all Learning words")
             Button(action: onCopyAll) { Image(systemName: "doc.on.doc") }.help("Copy all Learning words")
         }}
@@ -514,6 +527,7 @@ struct DetailViewContent: View {
     let onToast: (String, TimeInterval) -> Void
     let onBulkCopy: () -> Void
     let onJumpToWord: (Word) -> Void
+    let onSelectBatch: () -> Void
     let onSelectAll: () -> Void
     let onCopyAll: () -> Void
     let onUndo: () -> Void
@@ -545,7 +559,7 @@ struct DetailViewContent: View {
                 .navigationTitle(!searchText.isEmpty ? "Results" : (selectedBook?.title ?? "All Words"))
                 .searchable(text: $searchText, prompt: "Search words or usage...")
                 .toolbar {
-                    ToolbarItem(placement: .status) { SelectionStatusView(count: selectedWordIds.count, onSelectAll: onSelectAll, onCopyAll: onCopyAll) }
+                    ToolbarItem(placement: .status) { SelectionStatusView(count: selectedWordIds.count, onSelectBatch: onSelectBatch, onSelectAll: onSelectAll, onCopyAll: onCopyAll) }
                     ToolbarItem(placement: .automatic) {
                         ActionToolbar(
                             dbManager: dbManager,
@@ -593,9 +607,18 @@ struct SQLiteFile: FileDocument {
 }
 
 extension DatabaseManager {
+    private func learningWords(limit: Int? = nil) -> [Word] {
+        let learning = words.filter { $0.status == .learning }
+        if let limit {
+            return Array(learning.prefix(max(0, limit)))
+        }
+        return learning
+    }
+
     func formatSelected(ids: Set<Word.ID>) -> String { words.filter { ids.contains($0.id) }.map { "\($0.text)\n\($0.usage ?? "")" }.joined(separator: "\n\n") }
-    func formatAllLearning() -> String { words.filter { $0.status == .learning }.map { "\($0.text)\n\($0.usage ?? "")" }.joined(separator: "\n\n") }
-    func masterAllLearning() { updateStatus(words: words.filter { $0.status == .learning }, newStatus: .mastered) }
+    func formatAllLearning() -> String { learningWords().map { "\($0.text)\n\($0.usage ?? "")" }.joined(separator: "\n\n") }
+    func learningWordIds(limit: Int) -> [Word.ID] { learningWords(limit: limit).map(\.id) }
+    func masterAllLearning() { updateStatus(words: learningWords(), newStatus: .mastered) }
     func masterSelected(ids: Set<Word.ID>) { updateStatus(words: words.filter { ids.contains($0.id) && $0.status != .mastered }, newStatus: .mastered) }
     func updateStatus(word: Word, newStatus: WordStatus, bulkIds: Set<Word.ID>) {
         if bulkIds.contains(word.id) { updateStatus(words: words.filter { bulkIds.contains($0.id) }, newStatus: newStatus) }
