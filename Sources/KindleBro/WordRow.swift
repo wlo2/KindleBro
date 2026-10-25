@@ -14,10 +14,10 @@ struct WordRow: View {
     let dbManager: DatabaseManager // only for fetches; observing it re-rendered every row on any change
     
     @State private var isExpanded = false
-    @State private var isStemPopoverPresented = false
-    @State private var isStemLoading = false
-    @State private var stemWords: [Word] = []
-    @State private var stemRequestId = UUID()
+    @State private var isRelatedPopoverPresented = false
+    @State private var isRelatedLoading = false
+    @State private var relatedWords: [Word] = []
+    @State private var relatedRequestId = UUID()
     
     private func copyToClipboard(_ text: String) {
         let pasteboard = NSPasteboard.general
@@ -27,23 +27,23 @@ struct WordRow: View {
     }
 
     @ViewBuilder
-    private var stemPopoverContent: some View {
+    private var relatedPopoverContent: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Related words")
                 .font(.headline)
-            if isStemLoading {
+            if isRelatedLoading {
                 ProgressView()
                     .controlSize(.small)
-            } else if stemWords.isEmpty {
+            } else if relatedWords.isEmpty {
                 Text("No related words found.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             } else {
                 VStack(alignment: .leading, spacing: 2) {
-                ForEach(stemWords) { related in
+                ForEach(relatedWords) { related in
                     Button(action: {
                         onJumpToWord(related)
-                        isStemPopoverPresented = false
+                        isRelatedPopoverPresented = false
                     }) {
                         HStack(spacing: 8) {
                             Text(related.text)
@@ -81,28 +81,28 @@ struct WordRow: View {
         .frame(minWidth: 260, maxWidth: 360)
     }
 
-    private var hasStemMatches: Bool {
-        word.stemOtherBookCount > 0
+    private var hasRelatedWords: Bool {
+        word.relatedBookCount > 0
     }
     
-    private func toggleStemGroup() {
-        if isStemPopoverPresented {
-            isStemPopoverPresented = false
+    private func toggleRelatedPopover() {
+        if isRelatedPopoverPresented {
+            isRelatedPopoverPresented = false
             return
         }
         let requestId = UUID()
-        stemRequestId = requestId
-        isStemLoading = true
-        dbManager.fetchStemMatches(for: word) { matches in
-            guard stemRequestId == requestId else { return }
+        relatedRequestId = requestId
+        isRelatedLoading = true
+        dbManager.fetchRelatedWords(for: word) { matches in
+            guard relatedRequestId == requestId else { return }
             var t = Transaction()
             t.animation = nil
             withTransaction(t) {
-                self.stemWords = matches
-                self.isStemLoading = false
+                self.relatedWords = matches
+                self.isRelatedLoading = false
             }
         }
-        isStemPopoverPresented = true
+        isRelatedPopoverPresented = true
     }
     
     var body: some View {
@@ -146,8 +146,8 @@ struct WordRow: View {
                     .help("Show other contexts")
                 }
 
-                if enableRelatedWords && hasStemMatches {
-                    Button(action: { toggleStemGroup() }) {
+                if enableRelatedWords && hasRelatedWords {
+                    Button(action: { toggleRelatedPopover() }) {
                         Circle()
                             .fill(Color.red)
                             .frame(width: 8, height: 8)
@@ -155,9 +155,9 @@ struct WordRow: View {
                             .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
-                    .help(isStemPopoverPresented ? "Hide related words" : "Show related words")
-                    .popover(isPresented: $isStemPopoverPresented, arrowEdge: .trailing) {
-                        stemPopoverContent
+                    .help(isRelatedPopoverPresented ? "Hide related words" : "Show related words")
+                    .popover(isPresented: $isRelatedPopoverPresented, arrowEdge: .trailing) {
+                        relatedPopoverContent
                     }
                     .transaction { $0.animation = nil }
                 }
@@ -207,20 +207,20 @@ struct WordRow: View {
         .padding(.vertical, 4)
         .onChange(of: word.id) { _, _ in
             // Reset stem UI state when the row is reused for a different word.
-            isStemPopoverPresented = false
-            isStemLoading = false
-            stemWords = []
-            stemRequestId = UUID()
+            isRelatedPopoverPresented = false
+            isRelatedLoading = false
+            relatedWords = []
+            relatedRequestId = UUID()
         }
         .onChange(of: word.allUsages.count) { _, count in
             // A list refresh brings back only the latest usage; reload the rest if still expanded.
             if isExpanded && count <= 1 { dbManager.fetchUsages(for: word) }
         }
-        .onChange(of: word.stemOtherBookCount) { _, newValue in
+        .onChange(of: word.relatedBookCount) { _, newValue in
             if newValue <= 0 {
-                isStemPopoverPresented = false
-                isStemLoading = false
-                stemWords = []
+                isRelatedPopoverPresented = false
+                isRelatedLoading = false
+                relatedWords = []
             }
         }
         .contextMenu {

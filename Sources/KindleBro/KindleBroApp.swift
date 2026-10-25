@@ -101,18 +101,15 @@ struct KindleBroApp: App {
     
     init() {
         let defaults = UserDefaults.standard
-        let removedKeys = ["openAIKey", "geminiKey", "activeProvider", "openaiModel", "geminiModel"]
-        // shortcut: 1.2 -> 1.3 upgrade steps (old bundle id, AI keys); delete in 1.4.
-        // The bundle id changed from com.example.KindleBro: carry old settings over once, minus the removed AI ones.
-        let oldDomain = "com.example.KindleBro"
-        if let id = Bundle.main.bundleIdentifier, id != oldDomain, let old = defaults.persistentDomain(forName: oldDomain) {
-            for (key, value) in old where !removedKeys.contains(key) && defaults.object(forKey: key) == nil {
-                defaults.set(value, forKey: key)
-            }
-            defaults.removePersistentDomain(forName: oldDomain)
-        }
-        removedKeys.forEach { defaults.removeObject(forKey: $0) }
-        defaults.register(defaults: ["enableStemSearch": true, "enableRelatedWords": true])
+        // Single source of the setting defaults; the views' @AppStorage fallbacks only apply without this.
+        defaults.register(defaults: [
+            "enableStemSearch": true,
+            "enableRelatedWords": true,
+            "enableCompletedBooks": true,
+            "autoMasterOnCopy": true,
+            "learningBatchSize": 15,
+            "customPrompt": defaultPrompt,
+        ])
         
         // Settings opens with the cursor in its only text field (batch size). Clear it at the AppKit
         // level: a view-level FocusState fix missed every second open (stale focus state, late subscription).

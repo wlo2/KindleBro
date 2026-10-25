@@ -8,11 +8,12 @@ KindleBro is a small native macOS app for Apple silicon that helps you work thro
 It is made mainly for advanced language learners who use spaced repetition (SRS). Reading fiction is one of the most efficient ways to collect new vocabulary.
 
 Inspired by [Kindle Mate](https://sourceforge.net/projects/kmate/). Free and open source.
-![Main Screen](Main_screen.png)
+![Main Screen](Main_screen.jpg)
 ## Features
 ### Kindle integration
 - One-click sync imports `vocab.db` straight from a connected Kindle.
 - Words are grouped by book, newest first, so you can process a book in batches as you read it.
+- Different forms of a word in the same book, such as «vitiated» and «vitiates», are shown as one entry under the dictionary form («vitiate»). The entry keeps every form's sentences, and its status applies to all forms. Forms come from Apple's language tools (English and Russian), with Kindle's stem as a fallback for rare words.
 - If the same book appears more than once (for example, words synced from two Kindles), it is shown as one book and each word appears once.
 ### Word processing
 - Imported words start in the `Learning` state. From there you can mark them:
@@ -53,7 +54,7 @@ Inspired by [Kindle Mate](https://sourceforge.net/projects/kmate/). Free and ope
     - For English it also matches other forms of a word: «peeved» finds «peeve». Usage text is matched literally.
     - `%` and `_` are searched as plain characters.
     - Clicking a result opens its book and selects the word.
-- Related words: words with the same stem in other books are marked with a red dot. Click it to see them and jump to one. You can turn this off in Settings, along with stem-based search.
+- Related words: words with the same dictionary form in other books are marked with a red dot. Click it to see them and jump to one. You can turn this off in Settings, along with stem-based search.
 ### Library
 - Import a `vocab.db` from any location with File ▸ Import Database….
 - You can import several `vocab.db` files into one library. Imports only add: existing word states are kept. An import either completes fully or changes nothing, and any error is shown.

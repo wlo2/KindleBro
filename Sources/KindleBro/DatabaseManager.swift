@@ -13,11 +13,7 @@ class DatabaseManager: ObservableObject {
     private let dbQueue = DispatchQueue(label: "KindleBro.DatabaseQueue")
     private let dbQueueKey = DispatchSpecificKey<Void>()
     private var fetchWordsWorkItem: DispatchWorkItem?
-    private let stemQueue = DispatchQueue(label: "KindleBro.StemQueue", qos: .userInitiated, attributes: .concurrent)
-    // NLTagger costs ~0.15 ms per word and the same words come back on every fetch, so remember results.
-    // Bounded by the number of distinct words in the library.
-    private var normalizedKeyCache: [String: String] = [:]
-    private let normalizedKeyLock = NSLock()
+    private let relatedQueue = DispatchQueue(label: "KindleBro.RelatedQueue", qos: .userInitiated, attributes: .concurrent)
     
     @Published var books: [Book] = []
     @Published var words: [Word] = []
@@ -83,6 +79,7 @@ class DatabaseManager: ObservableObject {
                     // Scenario B: Merge
                     guard let db = self.db else { throw AppError.dbError("Database not loaded") }
                     addedCount = try Self.mergeDatabase(sourceURL: url, into: db)
+                    self.updateLemmas() // for the newly added words
                     self.fetchBooks()
                 }
                 
@@ -105,12 +102,12 @@ class DatabaseManager: ObservableObject {
             
             try createSettingsTable()
             try createIndices()
-            try migratePreferredUsages()
             
             DispatchQueue.main.async {
                 self.isDatabaseLoaded = true
                 self.appError = nil
             }
+            updateLemmas()
             fetchBooks()
         } catch {
             db = nil // half-opened (e.g. not a SQLite file) counts as not loaded
@@ -170,13 +167,6 @@ class DatabaseManager: ObservableObject {
         // Create indices to speed up joins and filtering
         try db.run("CREATE INDEX IF NOT EXISTS idx_lookups_word_book_ts ON LOOKUPS (word_key, book_key, timestamp)")
         try db.run("CREATE INDEX IF NOT EXISTS idx_lookups_book_word_ts ON LOOKUPS (book_key, word_key, timestamp)")
-        // NOCASE so the related-words lookup (case-insensitive) can use it
-        try db.run("CREATE INDEX IF NOT EXISTS idx_words_stem_nocase ON WORDS (stem COLLATE NOCASE)")
-        // shortcut: cleanup for libraries from 1.2 and older; delete in 1.4.
-        try db.run("DROP INDEX IF EXISTS idx_words_stem")
-        try db.run("DROP INDEX IF EXISTS idx_lookups_word_key")
-        try db.run("DROP INDEX IF EXISTS idx_lookups_book_key")
-        try db.run("DROP INDEX IF EXISTS idx_words_id")
     }
     
     private func createSettingsTable() throws {
@@ -191,25 +181,6 @@ class DatabaseManager: ObservableObject {
         })
     }
     
-    // shortcut: 1.2 -> 1.3 upgrade step; delete in 1.4.
-    // Preferred usages used to be keyed by word only, so a choice made in one book showed up in others.
-    // Re-key each old entry to the book whose lookup holds that sentence, then drop the old entries.
-    private func migratePreferredUsages() throws {
-        guard let db = db else { return }
-        try db.transaction {
-            try db.run("""
-            INSERT OR IGNORE INTO settings (key, value)
-            SELECT 'pref_usage_' || L.word_key || '|' || B.title || '_' || B.authors, S.value
-            FROM settings S
-            JOIN LOOKUPS L ON L.word_key = substr(S.key, 12) AND L.usage = S.value
-            JOIN BOOK_INFO B ON B.id = L.book_key
-            WHERE S.key LIKE 'pref\\_usage\\_%' ESCAPE '\\' AND instr(S.key, '|') = 0
-            """)
-            try db.run("DELETE FROM settings WHERE key LIKE 'pref\\_usage\\_%' ESCAPE '\\' AND instr(key, '|') = 0")
-        }
-    }
-    
-    // `db` is read only on dbQueue: Clear Database and the first import replace it there.
     func saveSetting(key: String, value: String) {
         let settingsTable = Table("settings")
         let keyCol = Expression<String>("key")
@@ -282,28 +253,25 @@ class DatabaseManager: ObservableObject {
                     B.id,
                     B.title,
                     B.authors,
-                    W.word,
-                    W.lang,
+                    COALESCE(WL.lemma, lower(W.word)),
                     W.category
                 FROM BOOK_INFO B
                 JOIN LOOKUPS L ON L.book_key = B.id
                 JOIN WORDS W ON W.id = L.word_key
+                LEFT JOIN word_lemmas WL ON WL.word_id = W.id
                 ORDER BY B.id
                 """
                 
                 var bookMap: [String: Book] = [:]
-                var normalizedStatusesByBook: [String: [String: Set<WordStatus>]] = [:]
+                var lemmaStatusesByBook: [String: [String: Set<WordStatus>]] = [:]
                 
                 for row in try db.prepare(sql) {
                     let id = row[0] as! String
                     let title = row[1] as! String
                     let authors = row[2] as! String
-                    let word = row[3] as! String
-                    let wordLanguage = row[4] as! String
-                    let category = Int(row[5] as! Int64)
+                    let lemma = row[3] as! String // one entry per dictionary form
+                    let category = Int(row[4] as! Int64)
                     let status = WordStatus(rawValue: category) ?? .learning
-                    
-                    let normalizedWordKey = self.normalizedBookWordKey(text: word, language: wordLanguage)
                     
                     // Use a key to aggregate duplicates (Title + Authors), same as Word.bookKey
                     let bookKey = "\(title)_\(authors)"
@@ -318,14 +286,14 @@ class DatabaseManager: ObservableObject {
                         )
                     }
 
-                    var perBook = normalizedStatusesByBook[bookKey] ?? [:]
-                    var statuses = perBook[normalizedWordKey] ?? Set<WordStatus>()
+                    var perBook = lemmaStatusesByBook[bookKey] ?? [:]
+                    var statuses = perBook[lemma] ?? Set<WordStatus>()
                     statuses.insert(status)
-                    perBook[normalizedWordKey] = statuses
-                    normalizedStatusesByBook[bookKey] = perBook
+                    perBook[lemma] = statuses
+                    lemmaStatusesByBook[bookKey] = perBook
                 }
 
-                for (bookKey, statusesByWord) in normalizedStatusesByBook {
+                for (bookKey, statusesByWord) in lemmaStatusesByBook {
                     guard var book = bookMap[bookKey] else { continue }
                     book.wordCount = statusesByWord.count
                     book.learningWordCount = statusesByWord.values.filter { $0.contains(.learning) }.count
@@ -345,23 +313,23 @@ class DatabaseManager: ObservableObject {
         }
     }
 
-    private func englishStemCandidates(for text: String) -> [String] {
+    // Other forms a search should also find, matched against stored lemmas and word text.
+    private func searchCandidates(for text: String) -> [String] {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
-        // Avoid stemming multi-word searches or non-Latin queries.
+        // Avoid stemming multi-word searches.
         guard trimmed.rangeOfCharacter(from: .whitespacesAndNewlines) == nil else { return [] }
-        guard trimmed.range(of: "[A-Za-z]", options: .regularExpression) != nil else { return [] }
 
         let lower = trimmed.lowercased()
-        var candidates = Set<String>()
-
-        // Prefer lemma if available (do not hard-require language detection for short inputs).
-        let tagger = NLTagger(tagSchemes: [.lemma])
-        tagger.string = trimmed
-        let (lemma, _) = tagger.tag(at: trimmed.startIndex, unit: .word, scheme: .lemma)
-        if let lemma = lemma?.rawValue.lowercased(), !lemma.isEmpty {
-            candidates.insert(lemma)
+        // Russian: the dictionary form only ("слободы" finds "слободе" via lemma "слобода").
+        if trimmed.range(of: "\\p{Cyrillic}", options: .regularExpression) != nil {
+            let lemma = Self.lemma(word: trimmed, language: "ru", kindleStem: nil, usage: nil)
+            return lemma == lower ? [] : [lemma]
         }
+        guard trimmed.range(of: "[A-Za-z]", options: .regularExpression) != nil else { return [] }
+
+        // Same lemma rule as the stored lemmas, plus English suffix fallbacks for words Apple doesn't know.
+        var candidates: Set<String> = [Self.lemma(word: trimmed, language: "en", kindleStem: nil, usage: nil)]
 
         // Simple English stemming fallbacks for common suffixes.
         if lower.count > 3 {
@@ -394,54 +362,89 @@ class DatabaseManager: ObservableObject {
         return Array(candidates)
     }
 
-    private func englishStemCandidatesIfEnabled(for text: String) -> [String] {
+    private func searchCandidatesIfEnabled(for text: String) -> [String] {
         guard UserDefaults.standard.bool(forKey: "enableStemSearch") else {
             return []
         }
-        return englishStemCandidates(for: text)
+        return searchCandidates(for: text)
     }
 
-    private func isEnglishLanguage(_ language: String?) -> Bool {
-        guard let language else { return false }
-        let lower = language.lowercased()
-        return lower == "en" || lower.hasPrefix("en-") || lower == "english"
+    // MARK: - Lemmas (dictionary forms used to group a book's word forms)
+
+    // Bump when `lemma(...)` changes, so stored lemmas are recomputed.
+    private static let lemmaVersion = "2"
+
+    // Archaic pronouns: Apple maps thy, thine and thou to "thee", but each is its own word to learn.
+    private static let keepAsWritten: Set<String> = ["thou", "thee", "thy", "thine", "ye"]
+
+    // Dictionary form of a looked-up word: "vitiated" and "vitiates" both give "vitiate".
+    // Order: Apple's lemma for the word in its sentence (tells "drawing" the noun from "draw"),
+    // then for the word alone, then Kindle's stem (right for many rare words Apple doesn't know).
+    // Entries with spaces, hyphens or apostrophes stay as they are: the tagger splits them,
+    // which would merge "beau-ideal" into "beau".
+    static func lemma(word: String, language: String, kindleStem: String?, usage: String?) -> String {
+        let lower = word.lowercased()
+        guard !word.isEmpty, word.unicodeScalars.allSatisfy(CharacterSet.letters.contains),
+              !keepAsWritten.contains(lower) else { return lower }
+        let nl = NLLanguage(String(language.prefix { $0 != "-" }).lowercased())
+        if let usage, let found = taggedLemma(of: word, in: usage, language: nl) { return found }
+        if let found = taggedLemma(of: word, in: word, language: nl) { return found }
+        // Kindle's stem only if it starts like the word: it stems "insentience" as "sentience",
+        // which linked unrelated books. Accents are ignored, so "eclat" -> "éclat" still passes.
+        if let stem = kindleStem?.lowercased(), !stem.isEmpty,
+           stem.folding(options: .diacriticInsensitive, locale: nil)
+               .hasPrefix(lower.folding(options: .diacriticInsensitive, locale: nil).prefix(2)) {
+            return stem
+        }
+        return lower
     }
 
-    private func normalizedBookWordKey(text: String, language: String?) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lower = trimmed.lowercased()
-
-        guard isEnglishLanguage(language),
-              trimmed.rangeOfCharacter(from: .whitespacesAndNewlines) == nil,
-              trimmed.range(of: "[A-Za-z]", options: .regularExpression) != nil,
-              lower.hasSuffix("s") else {
-            return lower
+    private static func taggedLemma(of word: String, in text: String, language: NLLanguage) -> String? {
+        let tagger = NLTagger(tagSchemes: [.lemma])
+        tagger.string = text
+        tagger.setLanguage(language, range: text.startIndex..<text.endIndex)
+        var result: String?
+        tagger.enumerateTags(in: text.startIndex..<text.endIndex, unit: .word, scheme: .lemma,
+                             options: [.omitPunctuation, .omitWhitespace]) { tag, range in
+            // Whole-token match: matching a substring turned "so" into the lemma of "sob".
+            guard text[range].compare(word, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame else { return true }
+            result = tag?.rawValue.lowercased()
+            return false
         }
-
-        let cacheKey = "\(language ?? "")|\(trimmed)"
-        if let cached = normalizedKeyLock.withLock({ normalizedKeyCache[cacheKey] }) {
-            return cached
-        }
-        let result = taggedNounLemma(trimmed) ?? lower
-        normalizedKeyLock.withLock { normalizedKeyCache[cacheKey] = result }
-        return result
+        return result?.isEmpty == false ? result : nil
     }
 
-    private func taggedNounLemma(_ trimmed: String) -> String? {
-        let lower = trimmed.lowercased()
-        let tagger = NLTagger(tagSchemes: [.lemma, .lexicalClass])
-        tagger.string = trimmed
-        let (lemmaTag, _) = tagger.tag(at: trimmed.startIndex, unit: .word, scheme: .lemma)
-        let (classTag, _) = tagger.tag(at: trimmed.startIndex, unit: .word, scheme: .lexicalClass)
-
-        guard classTag == .noun,
-              let lemma = lemmaTag?.rawValue.lowercased(),
-              !lemma.isEmpty,
-              lemma != lower else {
-            return nil
+    // Computes lemmas for words that have none yet (new library, new import, or a new lemmaVersion).
+    // Stored so SQL can group by them; about 1 s for 4k words, once.
+    private func updateLemmas() {
+        guard DispatchQueue.getSpecific(key: dbQueueKey) != nil else {
+            dbQueue.async { self.updateLemmas() }
+            return
         }
-
-        return lemma
+        guard let db else { return }
+        do {
+            try db.run("CREATE TABLE IF NOT EXISTS word_lemmas (word_id TEXT PRIMARY KEY, lemma TEXT NOT NULL)")
+            try db.run("CREATE INDEX IF NOT EXISTS idx_word_lemmas_lemma ON word_lemmas (lemma)")
+            if getSetting(key: "lemmaVersion") != Self.lemmaVersion { try db.run("DELETE FROM word_lemmas") }
+            let missing = try db.prepare("""
+                SELECT W.id, W.word, W.lang, W.stem,
+                       (SELECT L.usage FROM LOOKUPS L WHERE L.word_key = W.id ORDER BY L.timestamp DESC LIMIT 1)
+                FROM WORDS W LEFT JOIN word_lemmas WL ON WL.word_id = W.id
+                WHERE WL.word_id IS NULL
+                """).map { row in
+                (row[0] as! String, Self.lemma(word: row[1] as? String ?? "", language: row[2] as? String ?? "",
+                                               kindleStem: row[3] as? String, usage: row[4] as? String))
+            }
+            try db.transaction {
+                for (id, lemma) in missing {
+                    try db.run("INSERT OR REPLACE INTO word_lemmas (word_id, lemma) VALUES (?, ?)", id, lemma)
+                }
+            }
+            saveSetting(key: "lemmaVersion", value: Self.lemmaVersion)
+        } catch {
+            // Without lemmas, words fall back to their own form (COALESCE in the queries).
+            print("Failed to update lemmas: \(error)")
+        }
     }
 
     private func mergedStatus(from statuses: [WordStatus]) -> WordStatus {
@@ -455,17 +458,16 @@ class DatabaseManager: ObservableObject {
         "\(wordId)|\(bookKey)"
     }
 
-    private func mergeCaseVariants(_ words: [Word], preferredUsages: [String: String]) -> [Word] {
+    private func groupByLemma(_ words: [Word], preferredUsages: [String: String]) -> [Word] {
         var merged: [String: Word] = [:]
         var order: [String] = []
 
         for word in words {
-            let normalizedKey = normalizedBookWordKey(text: word.text, language: word.language)
-            let groupKey = "\(word.bookKey)|\(normalizedKey)"
+            let groupKey = "\(word.bookKey)|\(word.lemma)"
             let preferred = { (id: String) in preferredUsages[Self.preferredUsageKey(wordId: id, bookKey: word.bookKey)] }
             if merged[groupKey] == nil {
                 var seed = word
-                seed.text = normalizedKey
+                seed.text = word.text.lowercased()
                 seed.databaseIds = word.allDatabaseIds
                 seed.databaseStatuses = word.databaseStatuses.isEmpty ? [word.databaseId: word.status] : word.databaseStatuses
                 seed.status = mergedStatus(from: Array(seed.databaseStatuses.values))
@@ -485,8 +487,9 @@ class DatabaseManager: ObservableObject {
                 current.databaseStatuses[id] = status
             }
 
-            current.text = normalizedKey
-            if normalizedKey == word.text.lowercased() {
+            // Several forms ("vitiated", "vitiates"): show the dictionary form. One form keeps its spelling.
+            if word.text.lowercased() != current.text { current.text = word.lemma }
+            if word.lemma == word.text.lowercased() {
                 current.databaseId = word.databaseId
             }
 
@@ -496,7 +499,7 @@ class DatabaseManager: ObservableObject {
             }
 
             current.usageCount += word.usageCount
-            current.stemOtherBookCount = max(current.stemOtherBookCount, word.stemOtherBookCount)
+            current.relatedBookCount = max(current.relatedBookCount, word.relatedBookCount)
 
             for usage in word.allUsages where !current.allUsages.contains(usage) {
                 current.allUsages.append(usage)
@@ -516,34 +519,34 @@ class DatabaseManager: ObservableObject {
         }
     }
 
-    // Builds a Word from a row shaped: id, word, stem, lang, category, usage, timestamp,
-    // book id, book title, book authors, stem_other_book_count, usage_count
+    // Builds a Word from a row shaped: id, word, category, usage, timestamp,
+    // book id, book title, book authors, related_book_count, usage_count, lemma
     private func makeWord(_ row: Statement.Element) -> Word {
         let id = row[0] as! String
         let text = row[1] as! String
-        let lang = row[3] as! String
-        let usage = row[5] as! String
-        let ts = row[6] as! Int64
-        let bookTitle = row[8] as! String
-        let bookAuthors = row[9] as! String
-        let status = WordStatus(rawValue: Int(row[4] as! Int64)) ?? .learning
+        let lemma = row[10] as! String
+        let usage = row[3] as! String
+        let ts = row[4] as! Int64
+        let bookTitle = row[6] as! String
+        let bookAuthors = row[7] as! String
+        let status = WordStatus(rawValue: Int(row[2] as! Int64)) ?? .learning
         return Word(
             // Keyed by book title + authors so duplicate BOOK_INFO rows of one book get one stable id
-            id: "\(normalizedBookWordKey(text: text, language: lang))_\(bookTitle)_\(bookAuthors)",
+            id: "\(lemma)_\(bookTitle)_\(bookAuthors)",
             databaseId: id,
             databaseIds: [id],
             databaseStatuses: [id: status],
             text: text,
-            language: lang,
+            lemma: lemma,
             status: status,
             usage: usage,
             allUsages: [WordUsage(text: usage, timestamp: ts)],
-            usageCount: Int(row[11] as! Int64),
-            bookId: row[7] as? String,
+            usageCount: Int(row[9] as! Int64),
+            bookId: row[5] as? String,
             bookTitle: bookTitle,
             bookAuthors: bookAuthors,
             timestamp: ts,
-            stemOtherBookCount: Int(row[10] as! Int64)
+            relatedBookCount: Int(row[8] as! Int64)
         )
     }
     
@@ -644,58 +647,53 @@ class DatabaseManager: ObservableObject {
                 """)
 
                 if relatedWordsEnabled {
-                    // With a book open, only count stems that occur in that book.
+                    // Related words: same lemma in other books. With a book open, only count its lemmas.
                     if bookFilterClause != nil {
                         withParts.append("""
-                        book_stems AS (
-                            SELECT DISTINCT W.stem AS stem
-                            FROM WORDS W
-                            JOIN LOOKUPS L ON L.word_key = W.id
-                            WHERE W.stem IS NOT NULL AND W.stem != ''
-                              AND L.book_key IN (SELECT id FROM book_filter)
+                        book_lemmas AS (
+                            SELECT DISTINCT WL.lemma AS lemma
+                            FROM word_lemmas WL
+                            JOIN LOOKUPS L ON L.word_key = WL.word_id
+                            WHERE L.book_key IN (SELECT id FROM book_filter)
                         )
                         """)
                     }
-                    let bookStemsJoin = bookFilterClause != nil ? "JOIN book_stems BS ON BS.stem = W.stem" : ""
+                    let bookLemmasJoin = bookFilterClause != nil ? "JOIN book_lemmas BLM ON BLM.lemma = WL.lemma" : ""
                     withParts.append("""
-                    stem_book_counts AS (
-                        SELECT W.stem AS stem, COUNT(DISTINCT SB.title || '_' || SB.authors) AS book_count
-                        FROM WORDS W
-                        JOIN LOOKUPS L ON L.word_key = W.id
+                    lemma_book_counts AS (
+                        SELECT WL.lemma AS lemma, COUNT(DISTINCT SB.title || '_' || SB.authors) AS book_count
+                        FROM word_lemmas WL
+                        JOIN LOOKUPS L ON L.word_key = WL.word_id
                         JOIN BOOK_INFO SB ON SB.id = L.book_key
-                        \(bookStemsJoin)
-                        WHERE W.stem IS NOT NULL AND W.stem != ''
-                        GROUP BY W.stem
+                        \(bookLemmasJoin)
+                        GROUP BY WL.lemma
                     )
                     """)
                 }
 
                 let withClause = "WITH " + withParts.joined(separator: ",\n")
-                let stemSelect = relatedWordsEnabled
-                    ? """
-                    CASE
-                        WHEN W.stem IS NULL OR W.stem = '' THEN 0
-                        ELSE COALESCE(stem_book_counts.book_count, 1) - 1
-                    END as stem_other_book_count,
-                    """
-                    : "0 as stem_other_book_count,"
-                let stemJoin = relatedWordsEnabled ? "LEFT JOIN stem_book_counts ON stem_book_counts.stem = W.stem" : ""
+                let relatedSelect = relatedWordsEnabled
+                    ? "COALESCE(lemma_book_counts.book_count, 1) - 1 as related_book_count,"
+                    : "0 as related_book_count,"
+                let relatedJoin = relatedWordsEnabled ? "LEFT JOIN lemma_book_counts ON lemma_book_counts.lemma = WL.lemma" : ""
 
                 var sql = """
                 \(withClause)
                 SELECT
-                    W.id, W.word, W.stem, W.lang, W.category,
+                    W.id, W.word, W.category,
                     L.usage,
                     latest.latest_ts,
                     B.id as book_id, B.title as book_title, B.authors as book_authors,
-                    \(stemSelect)
-                    usage_counts.usage_count
+                    \(relatedSelect)
+                    usage_counts.usage_count,
+                    COALESCE(WL.lemma, lower(W.word)) as lemma
                 FROM latest
                 JOIN WORDS W ON W.id = latest.word_key
                 JOIN BOOK_INFO B ON B.id = latest.book_key
                 JOIN LOOKUPS L ON L.rowid = latest.latest_rowid
                 JOIN usage_counts ON usage_counts.word_key = latest.word_key AND usage_counts.book_key = latest.book_key
-                \(stemJoin)
+                LEFT JOIN word_lemmas WL ON WL.word_id = W.id
+                \(relatedJoin)
                 """
                 
                 var conditions: [String] = []
@@ -706,11 +704,11 @@ class DatabaseManager: ObservableObject {
                         "W.word LIKE \(Self.containsPattern(lowerSearch))"
                     ]
 
-                    let stems = self.englishStemCandidatesIfEnabled(for: search)
+                    let stems = self.searchCandidatesIfEnabled(for: search)
                     for stem in stems {
                         let sanitizedStem = stem.replacingOccurrences(of: "'", with: "''")
-                        wordConditions.append("W.stem = '\(sanitizedStem)'")
-                        // Fallback to word matching on stem in case the DB stem differs from our lemmatizer
+                        wordConditions.append("WL.lemma = '\(sanitizedStem)'")
+                        // Also match the candidate as text, for words whose stored lemma differs
                         wordConditions.append("W.word LIKE \(Self.containsPattern(stem))")
                     }
 
@@ -745,7 +743,7 @@ class DatabaseManager: ObservableObject {
                     rawWords.append(self.makeWord(row))
                 }
 
-                let finalWords = self.mergeCaseVariants(rawWords, preferredUsages: preferredUsages)
+                let finalWords = self.groupByLemma(rawWords, preferredUsages: preferredUsages)
                 
                 DispatchQueue.main.async {
                     if !workItem.isCancelled {
@@ -803,36 +801,17 @@ class DatabaseManager: ObservableObject {
         }
     }
 
-    func fetchStemMatches(for word: Word, completion: @escaping ([Word]) -> Void) {
-        stemQueue.async { [weak self] in
+    func fetchRelatedWords(for word: Word, completion: @escaping ([Word]) -> Void) {
+        relatedQueue.async { [weak self] in
             guard let self = self else { return }
             do {
-                let stemDb = try Connection(self.storeURL.path, readonly: true)
-                stemDb.busyTimeout = 5
+                let readDb = try Connection(self.storeURL.path, readonly: true)
+                readDb.busyTimeout = 5
 
-                // Prefer the DB stem for this word id to avoid inconsistencies.
-                var dbStem: String? = nil
-                if let row = try stemDb.prepare("SELECT stem FROM WORDS WHERE id = ?", word.databaseId).makeIterator().next() {
-                    dbStem = row[0] as? String
-                }
-
-                let derivedCandidates = self.englishStemCandidatesIfEnabled(for: word.text)
-                let candidates = Array(Set(derivedCandidates)).filter { $0.count >= 3 }
-
-                let cleanDbStem = dbStem?.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard cleanDbStem?.isEmpty == false || !candidates.isEmpty else {
-                    DispatchQueue.main.async { completion([]) }
-                    return
-                }
-
-                var stems = candidates.filter { $0 != cleanDbStem?.lowercased() }
-                if let cleanDbStem, !cleanDbStem.isEmpty { stems.insert(cleanDbStem, at: 0) }
-                // COLLATE NOCASE matches idx_words_stem_nocase, so this is an index lookup
-                let stemPredicates = stems.map { _ in "W.stem = ? COLLATE NOCASE" }.joined(separator: " OR ")
-
-                var sql = """
+                // Same lemma as the red-dot count in fetchWords, so the popover lists exactly those books.
+                let sql = """
                 SELECT
-                    W.id, W.word, W.stem, W.lang, W.category,
+                    W.id, W.word, W.category,
                     (SELECT L2.usage
                      FROM LOOKUPS L2
                      WHERE L2.word_key = W.id AND L2.book_key = B.id
@@ -842,26 +821,25 @@ class DatabaseManager: ObservableObject {
                      FROM LOOKUPS L3
                      WHERE L3.word_key = W.id AND L3.book_key = B.id) as latest_ts,
                     B.id as book_id, B.title as book_title, B.authors as book_authors,
-                    0 as stem_other_book_count,
+                    0 as related_book_count,
                     (SELECT COUNT(*)
                      FROM LOOKUPS L4
-                     WHERE L4.word_key = W.id AND L4.book_key = B.id) as usage_count
-                FROM WORDS W
+                     WHERE L4.word_key = W.id AND L4.book_key = B.id) as usage_count,
+                    WL.lemma as lemma
+                FROM word_lemmas WL
+                JOIN WORDS W ON W.id = WL.word_id
                 JOIN LOOKUPS L ON L.word_key = W.id
                 JOIN BOOK_INFO B ON L.book_key = B.id
-                WHERE (\(stemPredicates))
-                """
+                WHERE WL.lemma = ?
+                  AND NOT (B.title = ? AND B.authors = ?) -- other books only, including duplicate BOOK_INFO rows
+                GROUP BY W.id, B.id
+                """ + Self.statusOrderClause
 
-                // Exclude this word's own book, including its duplicate BOOK_INFO rows.
-                sql += " AND NOT (B.title = ? AND B.authors = ?)"
-                sql += " GROUP BY W.id, B.id" + Self.statusOrderClause
-
-                let bindings: [Binding?] = stems + [word.bookTitle ?? "", word.bookAuthors ?? ""]
-                let results = try stemDb.prepare(sql, bindings).map(self.makeWord)
-                let merged = self.mergeCaseVariants(results, preferredUsages: [:])
+                let results = try readDb.prepare(sql, word.lemma, word.bookTitle ?? "", word.bookAuthors ?? "").map(self.makeWord)
+                let merged = self.groupByLemma(results, preferredUsages: [:])
                 DispatchQueue.main.async { completion(merged) }
             } catch {
-                print("Error fetching stem matches: \(error)")
+                print("Error fetching related words: \(error)")
                 DispatchQueue.main.async { completion([]) }
             }
         }

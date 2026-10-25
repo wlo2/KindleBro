@@ -50,7 +50,7 @@ private func makeVocabDb(at url: URL, words: [(id: String, category: Int)], book
     #expect(try matches("back\\slash", "\\"))
 }
 
-// Library with book "A" stored twice (b1, b1dup), book "B", and an old-format (1.2) preferred usage.
+// Library with book "A" stored twice (b1, b1dup), book "B", and a preferred usage chosen in book B.
 private func makeLibrary() throws -> URL {
     let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -65,7 +65,7 @@ private func makeLibrary() throws -> URL {
     INSERT INTO WORDS VALUES ('en:peeve','peeve','peeve','en',0), ('en:peeved','peeved','peeve','en',0), ('en:glib','glib','glib','en',0);
     INSERT INTO LOOKUPS VALUES ('1','en:peeve','b1','sentence A',1), ('2','en:peeve','b2','sentence B',2),
                                ('3','en:peeved','b1dup','sentence A2',3), ('4','en:glib','b1','glib one',4);
-    INSERT INTO settings VALUES ('pref_usage_en:peeve','sentence B');
+    INSERT INTO settings VALUES ('pref_usage_en:peeve|B_Y','sentence B');
     """)
     return url
 }
@@ -78,28 +78,22 @@ private func makeLibrary() throws -> URL {
     }
 }
 
-@Test func migrationKeysOldPreferredUsageToItsBook() throws {
-    let url = try makeLibrary()
-    _ = DatabaseManager(storeURL: url)
-    let keys = try Connection(url.path).prepare("SELECT key FROM settings").map { $0[0] as! String }
-    #expect(keys == ["pref_usage_en:peeve|B_Y"])
-}
-
 @MainActor @Test func bookViewMergesDuplicateBookRowsAndKeepsUsagePerBook() async throws {
     UserDefaults.standard.register(defaults: ["enableRelatedWords": true, "enableStemSearch": true])
     let manager = DatabaseManager(storeURL: try makeLibrary())
     try await waitUntil { manager.books.count == 2 }
     let bookA = try #require(manager.books.first { $0.title == "A" })
     #expect(bookA.id == "b1")
-    #expect(bookA.wordCount == 3)
+    #expect(bookA.wordCount == 2) // peeve + peeved count once (same lemma), glib
 
     manager.fetchWords(for: bookA.id)
     try await waitUntil { !manager.words.isEmpty }
-    #expect(Set(manager.words.map(\.text)) == ["peeve", "peeved", "glib"])
+    #expect(Set(manager.words.map(\.text)) == ["peeve", "glib"])
     let peeve = try #require(manager.words.first { $0.text == "peeve" })
-    #expect(peeve.usage == "sentence A") // book B's chosen sentence must not leak in
-    #expect(peeve.stemOtherBookCount == 1) // book B; the duplicate row of A is not another book
-    #expect(manager.words.first { $0.text == "glib" }?.stemOtherBookCount == 0)
+    #expect(Set(peeve.allDatabaseIds) == ["en:peeve", "en:peeved"])
+    #expect(peeve.usage == "sentence A2") // newest form's sentence; book B's chosen sentence must not leak in
+    #expect(peeve.relatedBookCount == 1) // book B; the duplicate row of A is not another book
+    #expect(manager.words.first { $0.text == "glib" }?.relatedBookCount == 0)
 }
 
 @MainActor @Test func searchFindsStemMatchesAcrossBooks() async throws {
@@ -108,7 +102,7 @@ private func makeLibrary() throws -> URL {
     manager.fetchWords(for: nil, search: "peeved")
     try await waitUntil { !manager.words.isEmpty }
     #expect(manager.words.contains { $0.text == "peeve" && $0.bookTitle == "B" })
-    #expect(manager.words.contains { $0.text == "peeved" && $0.bookTitle == "A" })
+    #expect(manager.words.contains { $0.text == "peeve" && $0.bookTitle == "A" && $0.allDatabaseIds.count == 2 })
     #expect(!manager.words.contains { $0.text == "glib" })
 }
 
@@ -135,7 +129,7 @@ private func makeLibrary() throws -> URL {
     let peeve = try #require(manager.words.first { $0.text == "peeve" })
 
     let related = await withCheckedContinuation { done in
-        manager.fetchStemMatches(for: peeve) { done.resume(returning: $0) }
+        manager.fetchRelatedWords(for: peeve) { done.resume(returning: $0) }
     }
     #expect(related.map(\.bookTitle) == ["B"])
 }
@@ -184,10 +178,65 @@ private func category(_ url: URL, _ id: String) throws -> Int64? {
     #expect(heathenRows.count == 1)
     let heathen = try #require(heathenRows.first)
     #expect(Set(heathen.allDatabaseIds) == ["en:Heathen", "en:heathen"])
-    #expect(manager.books.first { $0.title == "A" }?.wordCount == 4)
+    #expect(manager.books.first { $0.title == "A" }?.wordCount == 3)
 
     manager.updateStatus(words: [heathen], newStatus: .mastered)
     _ = manager.getSetting(key: "flush")
     #expect(try category(url, "en:Heathen") == 100)
     #expect(try category(url, "en:heathen") == 100)
+}
+
+@Test func lemmaGroupsInflectedFormsAndKeepsCompounds() {
+    // The case that motivated lemmas: Kindle stores stem "vitiated" for "vitiated" but "vitiate" for "vitiates".
+    #expect(DatabaseManager.lemma(word: "vitiated", language: "en", kindleStem: "vitiated",
+                                  usage: "There is a satanic element involved, a vitiated but still-real black mass.") == "vitiate")
+    #expect(DatabaseManager.lemma(word: "vitiates", language: "en", kindleStem: "vitiate",
+                                  usage: "If so, this in no way vitiates the sacrament.") == "vitiate")
+    #expect(DatabaseManager.lemma(word: "beau-ideal", language: "en", kindleStem: "beau-ideal", usage: nil) == "beau-ideal")
+    #expect(DatabaseManager.lemma(word: "so", language: "en", kindleStem: "so",
+                                  usage: "She began to sob quietly, and so did he.") == "so")
+    #expect(DatabaseManager.lemma(word: "rondures", language: "en", kindleStem: "rondure", usage: nil) == "rondure")
+    #expect(DatabaseManager.lemma(word: "слободе", language: "ru", kindleStem: "слобода", usage: nil) == "слобода")
+    // Archaic pronouns stay separate words instead of all becoming "thee".
+    #expect(DatabaseManager.lemma(word: "thy", language: "en", kindleStem: "thy", usage: "Thy kingdom come.") == "thy")
+    #expect(DatabaseManager.lemma(word: "thine", language: "en", kindleStem: "thine", usage: nil) == "thine")
+    // Kindle's stem is used only when it starts like the word.
+    #expect(DatabaseManager.lemma(word: "insentience", language: "en", kindleStem: "sentience", usage: nil) == "insentience")
+    #expect(DatabaseManager.lemma(word: "eclat", language: "en", kindleStem: "éclat", usage: nil) == "éclat")
+}
+
+@MainActor @Test func inflectedFormsInOneBookAreOneRowWithRelatedBooks() async throws {
+    UserDefaults.standard.register(defaults: ["enableRelatedWords": true, "enableStemSearch": true])
+    let url = try makeLibrary()
+    try Connection(url.path).execute("""
+    INSERT INTO WORDS VALUES ('en:vitiated','vitiated','vitiated','en',0), ('en:vitiates','vitiates','vitiate','en',0);
+    INSERT INTO LOOKUPS VALUES
+      ('7','en:vitiates','b1','If so, this in no way vitiates the sacrament.',7),
+      ('8','en:vitiated','b1','There is a satanic element involved, a vitiated but still-real black mass.',8),
+      ('9','en:vitiated','b2','That explained the vitiated quality of cerebration.',9);
+    """)
+    let manager = DatabaseManager(storeURL: url)
+    try await waitUntil { manager.books.count == 2 }
+    manager.fetchWords(for: "b1")
+    try await waitUntil { !manager.words.isEmpty }
+
+    let rows = manager.words.filter { $0.lemma == "vitiate" }
+    #expect(rows.count == 1)
+    let vitiate = try #require(rows.first)
+    #expect(vitiate.text == "vitiate") // two forms: shown as the dictionary form
+    #expect(Set(vitiate.allDatabaseIds) == ["en:vitiated", "en:vitiates"])
+    #expect(vitiate.relatedBookCount == 1) // book B has "vitiated"
+}
+
+@MainActor @Test func russianSearchFindsOtherFormsByLemma() async throws {
+    UserDefaults.standard.register(defaults: ["enableRelatedWords": true, "enableStemSearch": true])
+    let url = try makeLibrary()
+    try Connection(url.path).execute("""
+    INSERT INTO WORDS VALUES ('ru:слободе','слободе','слобода','ru',0);
+    INSERT INTO LOOKUPS VALUES ('10','ru:слободе','b1','Жили в слободе тихо.',10);
+    """)
+    let manager = DatabaseManager(storeURL: url)
+    manager.fetchWords(for: nil, search: "слободы") // a form not in the library
+    try await waitUntil { !manager.words.isEmpty }
+    #expect(manager.words.map(\.lemma) == ["слобода"])
 }

@@ -32,7 +32,7 @@ struct Word: Identifiable, Hashable {
     var databaseIds: [String] = []
     var databaseStatuses: [String: WordStatus] = [:]
     var text: String
-    let language: String
+    let lemma: String // dictionary form; a book's forms with the same lemma show as one row
     var status: WordStatus
     var usage: String? // The active/preferred usage text
     var allUsages: [WordUsage] = [] // All available context examples with dates
@@ -41,7 +41,7 @@ struct Word: Identifiable, Hashable {
     let bookTitle: String? // From BOOK_INFO
     let bookAuthors: String? // From BOOK_INFO
     var timestamp: Int64 // Primary timestamp (often the latest)
-    var stemOtherBookCount: Int = 0 // Count of other books sharing the same stem
+    var relatedBookCount: Int = 0 // Count of other books sharing the same stem
     
     var date: Date {
         return Date(timeIntervalSince1970: TimeInterval(timestamp / 1000))
