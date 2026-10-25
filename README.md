@@ -3,65 +3,69 @@
 </p>
 
 # KindleBro
-KindleBro is a minimal, native Apple-silicon macOS application designed to help you manage and master your Kindle vocabulary. It provides an end-to-end workflow, from captured words to ready-to-use flashcards.
+KindleBro is a small native macOS app for Apple silicon that helps you work through the words you look up on your Kindle, from the first lookup to finished flashcards.
 
-The app is targeted primarily at advanced language learners who use SRS systems. Reading fiction is one of the most efficient ways to mine vocabulary.
+It is made mainly for advanced language learners who use spaced repetition (SRS). Reading fiction is one of the most efficient ways to collect new vocabulary.
 
-Inspired by [Kindle Mate](https://sourceforge.net/projects/kmate/). Completely free and opensource.
+Inspired by [Kindle Mate](https://sourceforge.net/projects/kmate/). Free and open source.
 ![Main Screen](Main_screen.png)
-## Key Features
-### 📖 Kindle Integration
-- **One-Click Sync**: Seamlessly import your `vocab.db` directly from a connected Kindle device.
-- **Library Organization**: Words are aggregated by book. Within each book, words are ordered in reverse chronological order, allowing efficient batch processing as you progress through a book.
-### Word Processing
-- Newly imported words are set to the `Learning` state. From there, they can be marked as:
-    - `Ignored` — for erroneously added words (there is no way to remove words from `vocab.db` on Kindle).
-    - `Mastered` — for processed words with created flashcards.
-- The goal is to process all words. When all words in a book are set to `Mastered` or `Ignored`, the book is marked as `Completed` and moved to the **Completed** section. This separates in-progress books from finished ones.
-- In-progress books show `Learning/Total` in the sidebar count, making it easier to track what is left to review at a glance.
-- With **Refresh** button, `Completed` and `Ignored` words are moved to the bottom of the list to simplify batch processing in word-dense books.
-- Each word includes its usage (the context sentence from the book). Context is critical for retrieval. If a word has multiple usages within the same book, a chevron appears, allowing you to select the preferred usage for subsequent processing.
+## Features
+### Kindle integration
+- One-click sync imports `vocab.db` straight from a connected Kindle.
+- Words are grouped by book, newest first, so you can process a book in batches as you read it.
+- If the same book appears more than once (for example, words synced from two Kindles), it is shown as one book and each word appears once.
+### Word processing
+- Imported words start in the `Learning` state. From there you can mark them:
+    - `Ignored`: words added by mistake (Kindle has no way to remove words from `vocab.db`).
+    - `Mastered`: words you have already made flashcards for.
+- The goal is to process every word. Once all words in a book are `Mastered` or `Ignored`, the book counts as `Completed` and moves to the Completed section, away from the books still in progress.
+- Books in progress show `Learning/Total` in the sidebar, so you can see at a glance what is left.
+- The Refresh button moves `Mastered` and `Ignored` words to the bottom of the list, which helps with batch processing in word-dense books.
+- Each word comes with its usage, the sentence from the book where you looked it up. Context matters for remembering a word. If a word was looked up several times in the same book, a chevron appears and you can pick the usage to use from then on. The choice is saved per book, so the same word in another book keeps its own usage.
 
 > [!note]  
-> Experiments with flashcards containing multiple usages showed that excessive information in a single card reduces retrieval quality. The app therefore limits each word to one preferred usage.
-- When the same word appears in multiple books, its status is shared. Marking a word as `Mastered` updates it across all books.
-- **Undo Support**: Easily revert status changes if you make a mistake.
-- **Automatic Incremental Backup**: Periodically or on app exit, KindleBro can efficiently export your entire library to a designated location (e.g., Dropbox or iCloud Drive) using SQLite's high-performance backup API.
+> In my experiments, flashcards with several usages were harder to recall than cards with one, because each card held too much. So the app keeps one preferred usage per word.
+- A word's status is shared across books: marking it `Mastered` in one book marks it everywhere.
+- Undo reverts status changes. A batch change, such as an arrow key press on several selected words, is undone in one step.
+- Automatic backup: when you quit, KindleBro can copy your whole library to a folder you choose (Dropbox or iCloud Drive, for example) using SQLite's backup API. Changing the backup settings also makes a full backup right away. If a backup fails, you get an alert; for a backup on quit, the alert appears at the next launch.
 
-### ⌨️ Keyboard-driven review
-- **Right Arrow**: 
-    - `Learning` → **Mastered**
-    - `Ignored` → **Learning**
-- **Left Arrow**:
-    - `Learning` → **Ignored**
-    - `Mastered` → **Learning**
-- **Cmd + C**: Copy selected words and their primary usage.
-- **Cmd + Shift + P**: Open Prompt Editor.
-- **Cmd + ,**: Open Settings.
-- Each word includes a copy icon for copying the word or its usage separately.
-- Multiple words can be selected using the Command key.
-- Dedicated buttons for:
-    - `Select learning batch` — selects the first configurable batch of `Learning` words in the current book.
+### Keyboard-driven review
+- Right Arrow:
+    - `Learning` → `Mastered`
+    - `Ignored` → `Learning`
+- Left Arrow:
+    - `Learning` → `Ignored`
+    - `Mastered` → `Learning`
+- Esc clears the selection.
+- Cmd + C copies the selected words with their primary usage.
+- Cmd + Shift + P opens the prompt editor.
+- Cmd + , opens Settings.
+- Each word has copy icons for copying the word or its usage on its own.
+- Hold Command to select several words.
+- Toolbar buttons:
+    - `Select learning batch` selects the first batch of `Learning` words in the current book (the batch size is set in Settings).
     - `Select all Learning words`
     - `Copy all Learning words`
     - `Copy selected words with prompt`
-### 🔍 Advanced Search & Discovery
-- **Book Title Search**: Quickly filter your book list.
-- **Global Search**: Search across the entire vocabulary library, including both words and contexts.
-    - Stem-based search for English. For example, «peeved» also finds «peeve», while usage text is matched literally.
-- **Related Words**: Words sharing the same stem across different books are grouped and shown via a red-dot popover, allowing quick navigation. This feature can be disabled in Settings, along with stem-based search.
-### Library Management
-- `vocab.db` can be imported from any location.
-- Multiple `vocab.db` files can be imported into a single library. The import mode is append-only.
-- The library can be exported for backup, including word states and the custom prompt.
+### Search
+- Book search filters the book list by title.
+- Global search looks through the whole library, both words and their usages.
+    - For English it also matches other forms of a word: «peeved» finds «peeve». Usage text is matched literally.
+    - `%` and `_` are searched as plain characters.
+    - Clicking a result opens its book and selects the word.
+- Related words: words with the same stem in other books are marked with a red dot. Click it to see them and jump to one. You can turn this off in Settings, along with stem-based search.
+### Library
+- Import a `vocab.db` from any location with File ▸ Import Database….
+- You can import several `vocab.db` files into one library. Imports only add: existing word states are kept. An import either completes fully or changes nothing, and any error is shown.
+- The library can be exported as a backup, including word states, preferred usages and the custom prompt.
 - The library can be erased.
-### AI-Powered Flashcards
-- **Dual AI Provider Support**: Use either **OpenAI** or **Google Gemini** to generate study materials. The model list is fetched dynamically to ensure access to recent models.
-- **Customizable Prompts**: Define your own prompt structure to generate flashcards exactly as required (e.g., Anki, RemNote, or custom formats).
-- **Auto-Mastering**: Optionally mark words as `Mastered` automatically when flashcards are generated or copied with a prompt.
-The default prompt targets [RemNote](https://www.remnote.com/) as most advanced SRS system:
+### Flashcards prompt
+- You write the prompt that turns words into flashcards, in whatever format you need. `Copy selected words with prompt` puts the prompt in front of the words; paste the result into the LLM chat of your choice.
+- Optionally, words copied with a prompt are marked `Mastered` automatically.
+
+Example prompt:
 ```
-For a given set of words and usage samples, generate RemNote flashcards in the following format:
+For a given set of words and usage samples, generate flashcards in the following format:
 
 word>>3 most frequent translations, ordered by descending frequency, with the most frequent translation wrapped in **bold**. After the translations, add a usage sample enclosed in backticks (``). At least one translation must be derived from the provided usage. If a word has fewer than three frequent translations, list only the available ones.  
 Each flashcard must be on a new line. Do not add any text, comments, or explanations — output **only** the generated flashcards.
@@ -70,40 +74,33 @@ Example:
 test>>**translation1**, translation2, translation3 `Usage example`
 ```
 > [!tip]  
-> The exact flashcard format can be customized via prompt engineering.
+> You can change the card format by editing the prompt.
 
-After testing various free models, `Gemini-3-Flash` currently produces the most reasonable translations. This is expected, as it ranks highly on the [MMMLU](https://llm-stats.com/benchmarks/mmmlu) benchmark.
-- **Dedicated AI Output**: View and copy AI-generated content in a specialized, non-intrusive results window.
-#### LLM usage for flashcard generation
-I was initially opposed to using LLMs for flashcard generation due to the relatively high error rate, and because writing cards manually improves retention.
-
-However, models have improved significantly. Translation hallucinations are now very rare, and proper prompt engineering reduces the error rate further. In particular, including usage examples gives the model enough context to choose more accurate translations.
-
-Even assuming occasional errors, LLM output should be compared to traditional dictionary lookup. In practice, LLM-based generation is significantly faster, which can justify a small number of imperfect cards in large batches.
-
-AI usage remains optional and is entirely up to personal preference.
 ## Install
-After installing the `.dmg`, remove the quarantine attribute:
+After installing from the `.dmg`, remove the quarantine attribute:
 ```
 xattr -d com.apple.quarantine /Applications/KindleBro.app
 ```
-## Local Build
-Run `./package.sh` to compile and create the `.dmg` installer and `.app` executable.
-## Suggested Workflow
-Assuming initial setup is complete:
+
+## Local build
+Run `./package.sh` to build the `.app` and the `.dmg` installer.
+
+Use Xcode if you can. It builds against the latest macOS SDK, which gives the app the Liquid Glass design. With only the Command Line Tools installed, the macOS 27 SDK lacks SwiftUI's macro plugin, so `package.sh` falls back to the macOS 26 SDK. Either way the app runs on macOS 14 and later.
+
+Run the tests with `swift test`. With only the Command Line Tools, pass the SDK and the Swift Testing macro plugin explicitly:
+```
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk swift test -Xswiftc -load-plugin-library -Xswiftc /Library/Developer/CommandLineTools/usr/lib/swift/host/plugins/testing/libTestingMacros.dylib
+```
+## Suggested workflow
+Once the app is set up:
 - Finish a book.
-- Connect your Kindle and sync new words using the **Sync** button.
-- Open the finished book and review all words:
-    - Mark erroneous or irrelevant words as `Ignored`.
-    - Mark known words as `Mastered`.
-- Press **Refresh** so that `Mastered` and `Ignored` words move to the bottom.
-- Press **Select all Learning words**.
-- Generate flashcards using **Generate flashcards**.
-- Press **Copy result**.
-- Paste the result into your SRS system. With proper prompt engineering, no additional formatting is required.
+- Connect your Kindle and press Sync to import the new words.
+- Open the book and go through all its words:
+    - Mark mistakes and irrelevant words `Ignored`.
+    - Mark words you already know `Mastered`.
+- Press Refresh to move `Mastered` and `Ignored` words to the bottom.
+- Press Select all Learning words.
+- Press Copy with prompt and paste into an LLM chat to generate the flashcards.
+- Paste the flashcards into your SRS app. With a good prompt, they need no further formatting.
 > [!tip]  
-> Up to 100 words per batch is recommended for word-heavy books.
-
----
-
-_«Turn every book you read into a library of knowledge you'll never forget.»_ — Gemini 3 Flash
+> For word-heavy books, keep batches to about 100 words.

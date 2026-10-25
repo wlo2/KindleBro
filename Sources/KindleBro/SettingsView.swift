@@ -25,6 +25,7 @@ private struct LearningBatchSizeRow: View {
                         }
                         if let parsed = Int(digits), parsed > 0 {
                             value = min(parsed, 500)
+                            if parsed > 500 { text = "500" } // show what will be saved
                         }
                     }
 
@@ -58,13 +59,6 @@ struct SettingsView: View {
     @AppStorage("enableRelatedWords") private var enableRelatedWords = true
     @AppStorage("enableStemSearch") private var enableStemSearch = true
     @AppStorage("learningBatchSize") private var learningBatchSize = 15
-    @AppStorage("openAIKey") private var openAIApiKey = ""
-    @AppStorage("geminiKey") private var geminiApiKey = ""
-    
-    // Updated Settings
-    @AppStorage("activeProvider") private var activeProvider: LLMProvider = .openai
-    @AppStorage("openaiModel") private var openaiModel: String = "gpt-4o"
-    @AppStorage("geminiModel") private var geminiModel: String = "gemini-2.0-flash"
     
     // Backup Settings
     @AppStorage("backupEnabled") private var backupEnabled = false
@@ -78,14 +72,6 @@ struct SettingsView: View {
     @State private var localLearningBatchSizeText = "15"
     @State private var localBackupEnabled = false
     @State private var localBackupLocation = ""
-    @State private var localOpenAIKey = ""
-    @State private var localGeminiKey = ""
-    @State private var localProvider: LLMProvider = .openai
-    @State private var localOpenAIModel: String = ""
-    @State private var localGeminiModel: String = ""
-    
-    @State private var models: [String] = []
-    @State private var isLoadingModels = false
     
     @Environment(\.dismiss) private var dismiss
 
@@ -137,70 +123,6 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                     }
                 }
-                
-                Section("AI Provider") {
-                    Picker("Active Provider", selection: $localProvider) {
-                        ForEach(LLMProvider.allCases, id: \.self) { provider in
-                            Text(provider.rawValue).tag(provider)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .onChange(of: localProvider) { _, _ in
-                        fetchModels()
-                    }
-                }
-                
-                if localProvider == .openai {
-                    Section("OpenAI Configuration") {
-                        LabeledContent("API Key") {
-                            SecureField("Enter Key", text: $localOpenAIKey)
-                                .textFieldStyle(.roundedBorder)
-                                .onChange(of: localOpenAIKey) { _, _ in
-                                    fetchModels()
-                                }
-                        }
-                        
-                        Picker("Model", selection: $localOpenAIModel) {
-                            if models.isEmpty {
-                                Text(localOpenAIModel).tag(localOpenAIModel)
-                            }
-                            ForEach(models, id: \.self) { model in
-                                Text(model).tag(model)
-                            }
-                        }
-                        .disabled(isLoadingModels || localOpenAIKey.isEmpty)
-                        
-                        if isLoadingModels {
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-                    }
-                } else {
-                    Section("Gemini Configuration") {
-                        LabeledContent("API Key") {
-                            SecureField("Enter Key", text: $localGeminiKey)
-                                .textFieldStyle(.roundedBorder)
-                                .onChange(of: localGeminiKey) { _, _ in
-                                    fetchModels()
-                                }
-                        }
-                        
-                        Picker("Model", selection: $localGeminiModel) {
-                            if models.isEmpty {
-                                Text(localGeminiModel).tag(localGeminiModel)
-                            }
-                            ForEach(models, id: \.self) { model in
-                                Text(model).tag(model)
-                            }
-                        }
-                        .disabled(isLoadingModels || localGeminiKey.isEmpty)
-                        
-                        if isLoadingModels {
-                            ProgressView()
-                                .controlSize(.small)
-                        }
-                    }
-                }
             }
             .formStyle(.grouped)
             
@@ -220,9 +142,6 @@ struct SettingsView: View {
                     enableRelatedWords = localEnableRelatedWords
                     enableStemSearch = localEnableStemSearch
                     learningBatchSize = max(1, min(localLearningBatchSize, 500))
-                    activeProvider = localProvider
-                    openaiModel = localOpenAIModel
-                    geminiModel = localGeminiModel
                     
                     let locationChanged = localBackupLocation != backupLocation
                     let backupEnabledChanged = localBackupEnabled != backupEnabled
@@ -232,17 +151,12 @@ struct SettingsView: View {
                     
                     // Trigger immediate backup if enabled and location set, and either setting changed
                     if localBackupEnabled && !localBackupLocation.isEmpty && (locationChanged || backupEnabledChanged) {
-                        try? DatabaseManager.shared.backup(to: URL(fileURLWithPath: localBackupLocation))
-                    }
-                    
-                    // Update OpenAI Key
-                    if localOpenAIKey != "****************" {
-                        openAIApiKey = localOpenAIKey
-                    }
-                    
-                    // Update Gemini Key
-                    if localGeminiKey != "****************" {
-                        geminiApiKey = localGeminiKey
+                        let db = DatabaseManager.shared
+                        do {
+                            try db.backup(to: URL(fileURLWithPath: localBackupLocation))
+                        } catch {
+                            db.appError = .backupError(error.localizedDescription)
+                        }
                     }
                     
                     dismiss()
@@ -252,7 +166,7 @@ struct SettingsView: View {
             }
             .padding()
         }
-        .frame(width: 500, height: 700)
+        .frame(width: 500, height: 540) // fits all rows, including the backup notes, without scrolling
         .onAppear {
             localAutoMaster = autoMasterOnCopy
             localEnableCompletedBooks = enableCompletedBooks
@@ -260,14 +174,8 @@ struct SettingsView: View {
             localEnableStemSearch = enableStemSearch
             localLearningBatchSize = learningBatchSize
             localLearningBatchSizeText = "\(learningBatchSize)"
-            localProvider = activeProvider
-            localOpenAIModel = openaiModel
-            localGeminiModel = geminiModel
             localBackupEnabled = backupEnabled
             localBackupLocation = backupLocation
-            localOpenAIKey = openAIApiKey.isEmpty ? "" : "****************"
-            localGeminiKey = geminiApiKey.isEmpty ? "" : "****************"
-            fetchModels()
         }
     }
     
@@ -283,49 +191,5 @@ struct SettingsView: View {
                 localBackupLocation = url.path
             }
         }
-    }
-    
-    private func fetchModels() {
-        let apiKey = (localProvider == .openai) 
-            ? (localOpenAIKey == "****************" ? openAIApiKey : localOpenAIKey)
-            : (localGeminiKey == "****************" ? geminiApiKey : localGeminiKey)
-            
-        guard !apiKey.isEmpty else { 
-            models = []
-            return 
-        }
-        
-        isLoadingModels = true
-        Task {
-            do {
-                let service = LLMServiceFactory.service(for: localProvider)
-                let fetchedModels = try await service.fetchModels(apiKey: apiKey)
-                await MainActor.run {
-                    self.models = fetchedModels
-                    self.isLoadingModels = false
-                    
-                    // Update local model selection if it's empty or invalid
-                    if localProvider == .openai {
-                        if localOpenAIModel.isEmpty || !fetchedModels.contains(localOpenAIModel) {
-                            localOpenAIModel = fetchedModels.first ?? "gpt-4o"
-                        }
-                    } else {
-                        if localGeminiModel.isEmpty || !fetchedModels.contains(localGeminiModel) {
-                            localGeminiModel = fetchedModels.first ?? "gemini-2.0-flash"
-                        }
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    self.isLoadingModels = false
-                }
-            }
-        }
-    }
-}
-
-struct SettingsView_Previews: PreviewProvider {
-    static var previews: some View {
-        SettingsView()
     }
 }

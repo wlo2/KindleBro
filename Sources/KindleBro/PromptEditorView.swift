@@ -21,7 +21,7 @@ struct PromptEditorView: View {
                 .padding(4)
                 .background(Color(nsColor: .controlBackgroundColor))
                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.secondary.opacity(0.2), lineWidth: 1))
-                .frame(minHeight: 100)
+                .frame(minHeight: 100, maxHeight: .infinity) // takes all spare height as the window grows
             
             HStack {
                 Button("Cancel", role: .cancel) {
@@ -40,8 +40,8 @@ struct PromptEditorView: View {
             }
         }
         .padding()
-        .frame(minWidth: 500, maxWidth: 800, minHeight: 300, maxHeight: 600)
-        .frame(width: 600, height: 400) // Default size
+        // Starting size comes from the scene's defaultSize; the window can be resized freely.
+        .frame(minWidth: 500, maxWidth: .infinity, minHeight: 300, maxHeight: .infinity)
         .onAppear {
             editedPrompt = prompt
         }

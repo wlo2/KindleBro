@@ -11,7 +11,7 @@ struct WordRow: View {
     let onJumpToWord: (Word) -> Void
     let enableRelatedWords: Bool
     let showBookTitle: Bool
-    @ObservedObject var dbManager: DatabaseManager
+    let dbManager: DatabaseManager // only for fetches; observing it re-rendered every row on any change
     
     @State private var isExpanded = false
     @State private var isStemPopoverPresented = false
@@ -39,6 +39,7 @@ struct WordRow: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             } else {
+                VStack(alignment: .leading, spacing: 2) {
                 ForEach(stemWords) { related in
                     Button(action: {
                         onJumpToWord(related)
@@ -68,9 +69,12 @@ struct WordRow: View {
                                     .font(.caption)
                             }
                         }
+                        .modifier(HoverHighlight())
                     }
                     .buttonStyle(.plain)
                 }
+                }
+                .padding(.horizontal, -8) // keep row text aligned with the title despite the highlight padding
             }
         }
         .padding(12)
@@ -208,6 +212,10 @@ struct WordRow: View {
             stemWords = []
             stemRequestId = UUID()
         }
+        .onChange(of: word.allUsages.count) { _, count in
+            // A list refresh brings back only the latest usage; reload the rest if still expanded.
+            if isExpanded && count <= 1 { dbManager.fetchUsages(for: word) }
+        }
         .onChange(of: word.stemOtherBookCount) { _, newValue in
             if newValue <= 0 {
                 isStemPopoverPresented = false
@@ -295,7 +303,8 @@ struct WordRow: View {
                     }
                     copyToClipboard(textToCopy)
                 }) {
-                    Image(systemName: "doc.on.doc")
+                    // Quote icon: copies the sentence, unlike the word's doc.on.doc icon
+                    Image(systemName: "text.quote")
                         .font(.caption)
                         .foregroundColor(.blue.opacity(0.7))
                 }
@@ -304,5 +313,22 @@ struct WordRow: View {
             }
         }
         .padding(.vertical, 2)
+    }
+}
+
+// Rounded highlight on hover, like native menu and toolbar items, so rows read as clickable.
+private struct HoverHighlight: ViewModifier {
+    @State private var isHovered = false
+
+    func body(content: Content) -> some View {
+        content
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.primary.opacity(isHovered ? 0.1 : 0))
+            )
+            .contentShape(Rectangle()) // whole row, including the gap before the icon, is clickable
+            .onHover { isHovered = $0 }
     }
 }

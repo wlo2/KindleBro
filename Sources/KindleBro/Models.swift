@@ -4,7 +4,6 @@ struct Book: Identifiable, Hashable {
     let id: String // BOOK_INFO.id
     let title: String
     let authors: String
-    let language: String
     var wordCount: Int = 0
     var learningWordCount: Int = 0
     var isMastered: Bool = false
@@ -33,7 +32,6 @@ struct Word: Identifiable, Hashable {
     var databaseIds: [String] = []
     var databaseStatuses: [String: WordStatus] = [:]
     var text: String
-    let stem: String?
     let language: String
     var status: WordStatus
     var usage: String? // The active/preferred usage text
@@ -49,6 +47,13 @@ struct Word: Identifiable, Hashable {
         return Date(timeIntervalSince1970: TimeInterval(timestamp / 1000))
     }
     
+    var allDatabaseIds: [String] {
+        databaseIds.isEmpty ? [databaseId] : databaseIds
+    }
+
+    // Duplicate BOOK_INFO rows of one book share this key
+    var bookKey: String { "\(bookTitle ?? "")_\(bookAuthors ?? "")" }
+
     var sortedUsages: [WordUsage] {
         return allUsages.sorted(by: { $0.timestamp > $1.timestamp })
     }
@@ -58,4 +63,13 @@ enum WordStatus: Int {
     case learning = 0
     case mastered = 100
     case ignored = -1
+
+    // List order: Learning, then Mastered, then Ignored
+    var sortRank: Int {
+        switch self {
+        case .learning: return 0
+        case .mastered: return 1
+        case .ignored: return 2
+        }
+    }
 }

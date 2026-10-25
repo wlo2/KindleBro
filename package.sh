@@ -8,6 +8,13 @@ ICON_SRC="icon.png"
 ICON_NAME="AppIcon"
 SRGB_PROFILE="/System/Library/ColorSync/Profiles/sRGB Profile.icc"
 
+# Command Line Tools 27 ship the macOS 27 SDK without SwiftUI's macro plugin (only Xcode has it),
+# so with CLT alone build against the macOS 26 SDK. The app targets macOS 14+, so it runs the same.
+if [ -z "$SDKROOT" ] && [ "$(xcode-select -p)" = "/Library/Developer/CommandLineTools" ] \
+    && [ -d /Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk ]; then
+    export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.sdk
+fi
+
 # 1. Build
 echo "Building..."
 swift build -c release -Xswiftc -D -Xswiftc APP_BUNDLE
@@ -25,6 +32,20 @@ mkdir -p "${APP_BUNDLE}/Contents/Resources"
 
 # 3. Copy Executable
 cp "${BUILD_DIR}/${APP_NAME}" "${APP_BUNDLE}/Contents/MacOS/"
+
+# SwiftPM records the deployment target (14.0) as the linked SDK version. macOS then runs the app in
+# its old-design compatibility mode (no Liquid Glass), so record the SDK actually used.
+MIN_OS=$(/usr/libexec/PlistBuddy -c "Print :LSMinimumSystemVersion" Info.plist)
+SDK_VERSION=$(xcrun --show-sdk-version)
+xcrun vtool -set-build-version macos "$MIN_OS" "$SDK_VERSION" -replace \
+    -output "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}" "${BUILD_DIR}/${APP_NAME}" || exit 1
+
+# Strip debug and local symbols: they hold absolute build paths (/Users/<name>/...) that would ship to users.
+strip -S -x "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}" || exit 1
+if LC_ALL=C grep -aq "/Users/" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"; then
+    echo "Build path still present in the binary; refusing to package."
+    exit 1
+fi
 
 # 4. Copy Info.plist
 cp Info.plist "${APP_BUNDLE}/Contents/"

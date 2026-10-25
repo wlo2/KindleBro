@@ -4,117 +4,96 @@ import SQLite
 import SQLite3
 
 class DatabaseManager: ObservableObject {
-    static let shared = DatabaseManager()
+    static let shared = DatabaseManager(storeURL: FileManager.default
+        .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("KindleBro/db.sqlite"))
     
+    let storeURL: URL
     private var db: Connection?
     private let dbQueue = DispatchQueue(label: "KindleBro.DatabaseQueue")
     private let dbQueueKey = DispatchSpecificKey<Void>()
     private var fetchWordsWorkItem: DispatchWorkItem?
-    private var stemDb: Connection?
     private let stemQueue = DispatchQueue(label: "KindleBro.StemQueue", qos: .userInitiated, attributes: .concurrent)
+    // NLTagger costs ~0.15 ms per word and the same words come back on every fetch, so remember results.
+    // Bounded by the number of distinct words in the library.
+    private var normalizedKeyCache: [String: String] = [:]
+    private let normalizedKeyLock = NSLock()
     
     @Published var books: [Book] = []
     @Published var words: [Word] = []
     @Published var isDatabaseLoaded = false
-    @Published var errorMessage: String?
     @Published var appError: AppError? // Central error state
     @Published var showClearConfirmation = false
     @Published var showExportPicker = false
+    @Published var showImportPicker = false // set from the File menu, like showExportPicker
     
     enum AppError: LocalizedError {
         case dbError(String)
         case importError(String)
-        case syncError(String)
+        case backupError(String)
         
         var errorDescription: String? {
             switch self {
             case .dbError(let msg): return "Database Error: \(msg)"
             case .importError(let msg): return "Import Failed: \(msg)"
-            case .syncError(let msg): return "Sync Failed: \(msg)"
+            case .backupError(let msg): return "Backup Failed: \(msg)"
             }
         }
     }
     
     // Undo
     struct UndoAction {
-        let changes: [(wordId: String, oldStatus: WordStatus)]
+        let changes: [String: WordStatus] // WORDS.id -> status before the change
     }
     @Published var undoStack: [UndoAction] = []
     
-    // Tables
     private let wordsTable = Table("WORDS")
-    private let lookupsTable = Table("LOOKUPS")
-    private let bookInfoTable = Table("BOOK_INFO")
-    
-    // Columns
-    // WORDS
     private let w_id = Expression<String>("id")
-    private let w_word = Expression<String>("word")
-    private let w_stem = Expression<String?>("stem")
-    private let w_lang = Expression<String>("lang")
     private let w_category = Expression<Int>("category")
     
-    // LOOKUPS
-    private let l_id = Expression<String>("id")
-    private let l_word_key = Expression<String>("word_key")
-    private let l_book_key = Expression<String>("book_key")
-    private let l_usage = Expression<String>("usage")
-    private let l_timestamp = Expression<Int64>("timestamp")
-    
-    // BOOK_INFO
-    private let b_id = Expression<String>("id")
-    private let b_title = Expression<String>("title")
-    private let b_authors = Expression<String>("authors")
-    private let b_lang = Expression<String>("lang")
-    
-    private init() {
+    // Tests pass a temporary file; the app uses `shared`.
+    init(storeURL: URL) {
+        self.storeURL = storeURL
         dbQueue.setSpecific(key: dbQueueKey, value: ())
-        // Try to load from persistent store on init
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let appDir = appSupport.appendingPathComponent("KindleBro")
-        let dbPath = appDir.appendingPathComponent("db.sqlite")
-        
-        if FileManager.default.fileExists(atPath: dbPath.path) {
-            loadDatabase(from: dbPath)
+        if FileManager.default.fileExists(atPath: storeURL.path) {
+            loadDatabase(from: storeURL)
         }
-    }
-    
-    func getPersistentStoreURL() throws -> URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let appDir = appSupport.appendingPathComponent("KindleBro")
-        
-        if !FileManager.default.fileExists(atPath: appDir.path) {
-            try FileManager.default.createDirectory(at: appDir, withIntermediateDirectories: true)
-        }
-        
-        return appDir.appendingPathComponent("db.sqlite")
     }
     
     func importDatabase(from url: URL, completion: ((Swift.Result<Int, Error>) -> Void)? = nil) {
-        do {
-            let targetURL = try getPersistentStoreURL()
-            var addedCount = 0
-            
-            if !FileManager.default.fileExists(atPath: targetURL.path) {
-                // Scenario A: First Run - Just copy
-                try FileManager.default.copyItem(at: url, to: targetURL)
-                loadDatabase(from: targetURL)
-                // Count all words as added
-                addedCount = try db?.scalar(wordsTable.count) ?? 0
-            } else {
-                // Scenario B: Merge
-                addedCount = try mergeDatabase(sourceURL: url, into: targetURL)
-                // Reload to reflect changes
-                loadDatabase(from: targetURL)
-            }
-            
-            DispatchQueue.main.async {
-                completion?(.success(addedCount))
-            }
-        } catch {
-            DispatchQueue.main.async {
-                self.errorMessage = "Import failed: \(error)"
-                completion?(.failure(error))
+        // On the DB queue so the merge never races other reads and writes on the same file.
+        dbQueue.async {
+            do {
+                let targetURL = self.storeURL
+                let addedCount: Int
+                
+                if !FileManager.default.fileExists(atPath: targetURL.path) {
+                    // Scenario A: First Run - Just copy
+                    try FileManager.default.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try FileManager.default.copyItem(at: url, to: targetURL)
+                    self.loadDatabase(from: targetURL)
+                    guard self.db != nil else {
+                        // Not a usable vocab.db: remove the copy so the next import starts fresh.
+                        try? FileManager.default.removeItem(at: targetURL)
+                        throw AppError.importError("The selected file is not a Kindle vocabulary database.")
+                    }
+                    // Count all words as added
+                    addedCount = try self.db?.scalar(self.wordsTable.count) ?? 0
+                } else {
+                    // Scenario B: Merge
+                    guard let db = self.db else { throw AppError.dbError("Database not loaded") }
+                    addedCount = try Self.mergeDatabase(sourceURL: url, into: db)
+                    self.fetchBooks()
+                }
+                
+                DispatchQueue.main.async {
+                    completion?(.success(addedCount))
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.appError = .importError(error.localizedDescription)
+                    completion?(.failure(error))
+                }
             }
         }
     }
@@ -123,20 +102,19 @@ class DatabaseManager: ObservableObject {
         do {
             print("Opening database at: \(url.path)")
             db = try Connection(url.path)
-            stemDb = try? Connection(url.path)
             
             try createSettingsTable()
             try createIndices()
+            try migratePreferredUsages()
             
             DispatchQueue.main.async {
                 self.isDatabaseLoaded = true
-                self.errorMessage = nil
                 self.appError = nil
             }
             fetchBooks()
         } catch {
+            db = nil // half-opened (e.g. not a SQLite file) counts as not loaded
             DispatchQueue.main.async {
-                self.errorMessage = "Failed to open database: \(error)"
                 self.appError = .dbError(error.localizedDescription)
             }
             print("Failed to open database: \(error)")
@@ -144,6 +122,10 @@ class DatabaseManager: ObservableObject {
     }
     
     func backup(to targetURL: URL) throws {
+        // Run behind any queued status writes so the backup includes them.
+        if DispatchQueue.getSpecific(key: dbQueueKey) == nil {
+            return try dbQueue.sync { try backup(to: targetURL) }
+        }
         guard let sourceHandle = db?.handle else {
             throw AppError.dbError("Database not loaded")
         }
@@ -186,12 +168,15 @@ class DatabaseManager: ObservableObject {
     private func createIndices() throws {
         guard let db = db else { return }
         // Create indices to speed up joins and filtering
-        try db.run("CREATE INDEX IF NOT EXISTS idx_lookups_word_key ON LOOKUPS (word_key)")
-        try db.run("CREATE INDEX IF NOT EXISTS idx_lookups_book_key ON LOOKUPS (book_key)")
         try db.run("CREATE INDEX IF NOT EXISTS idx_lookups_word_book_ts ON LOOKUPS (word_key, book_key, timestamp)")
         try db.run("CREATE INDEX IF NOT EXISTS idx_lookups_book_word_ts ON LOOKUPS (book_key, word_key, timestamp)")
-        try db.run("CREATE INDEX IF NOT EXISTS idx_words_id ON WORDS (id)")
-        try db.run("CREATE INDEX IF NOT EXISTS idx_words_stem ON WORDS (stem)")
+        // NOCASE so the related-words lookup (case-insensitive) can use it
+        try db.run("CREATE INDEX IF NOT EXISTS idx_words_stem_nocase ON WORDS (stem COLLATE NOCASE)")
+        // shortcut: cleanup for libraries from 1.2 and older; delete in 1.4.
+        try db.run("DROP INDEX IF EXISTS idx_words_stem")
+        try db.run("DROP INDEX IF EXISTS idx_lookups_word_key")
+        try db.run("DROP INDEX IF EXISTS idx_lookups_book_key")
+        try db.run("DROP INDEX IF EXISTS idx_words_id")
     }
     
     private func createSettingsTable() throws {
@@ -206,13 +191,32 @@ class DatabaseManager: ObservableObject {
         })
     }
     
-    func saveSetting(key: String, value: String) {
+    // shortcut: 1.2 -> 1.3 upgrade step; delete in 1.4.
+    // Preferred usages used to be keyed by word only, so a choice made in one book showed up in others.
+    // Re-key each old entry to the book whose lookup holds that sentence, then drop the old entries.
+    private func migratePreferredUsages() throws {
         guard let db = db else { return }
+        try db.transaction {
+            try db.run("""
+            INSERT OR IGNORE INTO settings (key, value)
+            SELECT 'pref_usage_' || L.word_key || '|' || B.title || '_' || B.authors, S.value
+            FROM settings S
+            JOIN LOOKUPS L ON L.word_key = substr(S.key, 12) AND L.usage = S.value
+            JOIN BOOK_INFO B ON B.id = L.book_key
+            WHERE S.key LIKE 'pref\\_usage\\_%' ESCAPE '\\' AND instr(S.key, '|') = 0
+            """)
+            try db.run("DELETE FROM settings WHERE key LIKE 'pref\\_usage\\_%' ESCAPE '\\' AND instr(key, '|') = 0")
+        }
+    }
+    
+    // `db` is read only on dbQueue: Clear Database and the first import replace it there.
+    func saveSetting(key: String, value: String) {
         let settingsTable = Table("settings")
         let keyCol = Expression<String>("key")
         let valueCol = Expression<String>("value")
         
         let work = {
+            guard let db = self.db else { return }
             do {
                 try db.run(settingsTable.insert(or: .replace, keyCol <- key, valueCol <- value))
             } catch {
@@ -228,12 +232,12 @@ class DatabaseManager: ObservableObject {
     }
     
     func getSetting(key: String) -> String? {
-        guard let db = db else { return nil }
         let settingsTable = Table("settings")
         let keyCol = Expression<String>("key")
         let valueCol = Expression<String>("value")
         
         let work = { () -> String? in
+            guard let db = self.db else { return nil }
             do {
                 if let row = try db.pluck(settingsTable.filter(keyCol == key)) {
                     return row[valueCol]
@@ -250,54 +254,41 @@ class DatabaseManager: ObservableObject {
         return dbQueue.sync(execute: work)
     }
     
-    private func mergeDatabase(sourceURL: URL, into targetURL: URL) throws -> Int {
-        // use standard SQLite connection to target, attach source
-        let db = try Connection(targetURL.path)
+    static func mergeDatabase(sourceURL: URL, into db: Connection) throws -> Int {
+        // ATTACH is not allowed inside a transaction, so attach first.
+        try db.run("ATTACH DATABASE ? AS source", sourceURL.path)
+        defer { _ = try? db.run("DETACH DATABASE source") }
         
-        // ATTACH 'source.db' AS source
-        let attachStmt = "ATTACH DATABASE ? AS source"
-        try db.run(attachStmt, sourceURL.path)
-        
-        // INSERT OR IGNORE INTO main.TABLE SELECT * FROM source.TABLE
-        // 1. WORDS
-        // We want to preserve our local changes.
-        // If the ID exists, IGNORE (keep local). This preserves 'category' (Mastered status).
-        try db.run("INSERT OR IGNORE INTO main.WORDS SELECT * FROM source.WORDS")
-        let addedWords = db.changes
-        
-        // 2. BOOK_INFO
-        try db.run("INSERT OR IGNORE INTO main.BOOK_INFO SELECT * FROM source.BOOK_INFO")
-        
-        // 3. LOOKUPS
-        try db.run("INSERT OR IGNORE INTO main.LOOKUPS SELECT * FROM source.LOOKUPS")
-        
-        // 4. METADATA / DICT_INFO ? Not critical for this app features but good for completeness
-        // try db.run("INSERT OR IGNORE INTO main.METADATA SELECT * FROM source.METADATA")
-        
-        // DETACH source
-        try db.run("DETACH DATABASE source")
-        
+        var addedWords = 0
+        // All or nothing, so a failed import never leaves words without their lookups.
+        try db.transaction {
+            // If the ID exists, IGNORE (keep local). This preserves 'category' (Mastered status).
+            try db.run("INSERT OR IGNORE INTO main.WORDS SELECT * FROM source.WORDS")
+            addedWords = db.changes
+            try db.run("INSERT OR IGNORE INTO main.BOOK_INFO SELECT * FROM source.BOOK_INFO")
+            try db.run("INSERT OR IGNORE INTO main.LOOKUPS SELECT * FROM source.LOOKUPS")
+        }
         return addedWords
     }
     
     func fetchBooks() {
-        guard let db = db else { return }
-        
         dbQueue.async { [weak self] in
-            guard let self = self else { return }
+            guard let self, let db = self.db else { return }
             do {
+                // DISTINCT: one row per word per book, not per lookup
+                // ORDER BY B.id: a book stored twice always gets its smallest id, so selection by id stays stable.
                 let sql = """
-                SELECT
+                SELECT DISTINCT
                     B.id,
                     B.title,
                     B.authors,
-                    B.lang,
                     W.word,
                     W.lang,
                     W.category
                 FROM BOOK_INFO B
                 JOIN LOOKUPS L ON L.book_key = B.id
                 JOIN WORDS W ON W.id = L.word_key
+                ORDER BY B.id
                 """
                 
                 var bookMap: [String: Book] = [:]
@@ -307,22 +298,20 @@ class DatabaseManager: ObservableObject {
                     let id = row[0] as! String
                     let title = row[1] as! String
                     let authors = row[2] as! String
-                    let lang = row[3] as! String
-                    let word = row[4] as! String
-                    let wordLanguage = row[5] as! String
-                    let category = Int(row[6] as! Int64)
+                    let word = row[3] as! String
+                    let wordLanguage = row[4] as! String
+                    let category = Int(row[5] as! Int64)
                     let status = WordStatus(rawValue: category) ?? .learning
                     
-                    // Use a key to aggregate duplicates (Title + Authors)
-                    let bookKey = "\(title)_\(authors)"
                     let normalizedWordKey = self.normalizedBookWordKey(text: word, language: wordLanguage)
                     
+                    // Use a key to aggregate duplicates (Title + Authors), same as Word.bookKey
+                    let bookKey = "\(title)_\(authors)"
                     if bookMap[bookKey] == nil {
                         bookMap[bookKey] = Book(
                             id: id,
                             title: title,
                             authors: authors,
-                            language: lang,
                             wordCount: 0,
                             learningWordCount: 0,
                             isMastered: true
@@ -339,9 +328,7 @@ class DatabaseManager: ObservableObject {
                 for (bookKey, statusesByWord) in normalizedStatusesByBook {
                     guard var book = bookMap[bookKey] else { continue }
                     book.wordCount = statusesByWord.count
-                    book.learningWordCount = statusesByWord.values.contains(where: { $0.contains(.learning) })
-                        ? statusesByWord.values.reduce(0) { $0 + ($1.contains(.learning) ? 1 : 0) }
-                        : 0
+                    book.learningWordCount = statusesByWord.values.filter { $0.contains(.learning) }.count
                     book.isMastered = book.learningWordCount == 0
                     bookMap[bookKey] = book
                 }
@@ -408,7 +395,7 @@ class DatabaseManager: ObservableObject {
     }
 
     private func englishStemCandidatesIfEnabled(for text: String) -> [String] {
-        guard UserDefaults.standard.bool(forKey: "enableStemSearch") || UserDefaults.standard.object(forKey: "enableStemSearch") == nil else {
+        guard UserDefaults.standard.bool(forKey: "enableStemSearch") else {
             return []
         }
         return englishStemCandidates(for: text)
@@ -431,6 +418,17 @@ class DatabaseManager: ObservableObject {
             return lower
         }
 
+        let cacheKey = "\(language ?? "")|\(trimmed)"
+        if let cached = normalizedKeyLock.withLock({ normalizedKeyCache[cacheKey] }) {
+            return cached
+        }
+        let result = taggedNounLemma(trimmed) ?? lower
+        normalizedKeyLock.withLock { normalizedKeyCache[cacheKey] = result }
+        return result
+    }
+
+    private func taggedNounLemma(_ trimmed: String) -> String? {
+        let lower = trimmed.lowercased()
         let tagger = NLTagger(tagSchemes: [.lemma, .lexicalClass])
         tagger.string = trimmed
         let (lemmaTag, _) = tagger.tag(at: trimmed.startIndex, unit: .word, scheme: .lemma)
@@ -440,7 +438,7 @@ class DatabaseManager: ObservableObject {
               let lemma = lemmaTag?.rawValue.lowercased(),
               !lemma.isEmpty,
               lemma != lower else {
-            return lower
+            return nil
         }
 
         return lemma
@@ -452,30 +450,33 @@ class DatabaseManager: ObservableObject {
         return .ignored
     }
 
+    // Settings key for a preferred usage: per word and per book
+    private static func preferredUsageKey(wordId: String, bookKey: String) -> String {
+        "\(wordId)|\(bookKey)"
+    }
+
     private func mergeCaseVariants(_ words: [Word], preferredUsages: [String: String]) -> [Word] {
         var merged: [String: Word] = [:]
         var order: [String] = []
 
         for word in words {
             let normalizedKey = normalizedBookWordKey(text: word.text, language: word.language)
-            let groupKey = "\(word.bookId ?? "")|\(normalizedKey)"
+            let groupKey = "\(word.bookKey)|\(normalizedKey)"
+            let preferred = { (id: String) in preferredUsages[Self.preferredUsageKey(wordId: id, bookKey: word.bookKey)] }
             if merged[groupKey] == nil {
                 var seed = word
                 seed.text = normalizedKey
-                seed.databaseIds = word.databaseIds.isEmpty ? [word.databaseId] : word.databaseIds
+                seed.databaseIds = word.allDatabaseIds
                 seed.databaseStatuses = word.databaseStatuses.isEmpty ? [word.databaseId: word.status] : word.databaseStatuses
-                seed.allUsages = word.allUsages
-                seed.usageCount = word.usageCount
                 seed.status = mergedStatus(from: Array(seed.databaseStatuses.values))
-                seed.usage = preferredUsages[seed.databaseId] ?? word.usage
+                seed.usage = preferred(seed.databaseId) ?? word.usage
                 merged[groupKey] = seed
                 order.append(groupKey)
                 continue
             }
 
             var current = merged[groupKey]!
-            let incomingIds = word.databaseIds.isEmpty ? [word.databaseId] : word.databaseIds
-            for id in incomingIds where !current.databaseIds.contains(id) {
+            for id in word.allDatabaseIds where !current.databaseIds.contains(id) {
                 current.databaseIds.append(id)
             }
 
@@ -491,7 +492,7 @@ class DatabaseManager: ObservableObject {
 
             if word.timestamp > current.timestamp {
                 current.timestamp = word.timestamp
-                current.usage = preferredUsages[current.databaseId] ?? word.usage
+                current.usage = preferred(current.databaseId) ?? word.usage
             }
 
             current.usageCount += word.usageCount
@@ -501,8 +502,7 @@ class DatabaseManager: ObservableObject {
                 current.allUsages.append(usage)
             }
 
-            let preferredUsage = current.databaseIds.compactMap { preferredUsages[$0] }.first
-            if let preferredUsage {
+            if let preferredUsage = current.databaseIds.compactMap(preferred).first {
                 current.usage = preferredUsage
             }
 
@@ -511,50 +511,78 @@ class DatabaseManager: ObservableObject {
         }
 
         return order.compactMap { merged[$0] }.sorted {
-            let lhsOrder: Int
-            switch $0.status {
-            case .learning: lhsOrder = 0
-            case .mastered: lhsOrder = 1
-            case .ignored: lhsOrder = 2
-            }
-            let rhsOrder: Int
-            switch $1.status {
-            case .learning: rhsOrder = 0
-            case .mastered: rhsOrder = 1
-            case .ignored: rhsOrder = 2
-            }
-            if lhsOrder != rhsOrder { return lhsOrder < rhsOrder }
+            if $0.status.sortRank != $1.status.sortRank { return $0.status.sortRank < $1.status.sortRank }
             return $0.timestamp > $1.timestamp
         }
     }
+
+    // Builds a Word from a row shaped: id, word, stem, lang, category, usage, timestamp,
+    // book id, book title, book authors, stem_other_book_count, usage_count
+    private func makeWord(_ row: Statement.Element) -> Word {
+        let id = row[0] as! String
+        let text = row[1] as! String
+        let lang = row[3] as! String
+        let usage = row[5] as! String
+        let ts = row[6] as! Int64
+        let bookTitle = row[8] as! String
+        let bookAuthors = row[9] as! String
+        let status = WordStatus(rawValue: Int(row[4] as! Int64)) ?? .learning
+        return Word(
+            // Keyed by book title + authors so duplicate BOOK_INFO rows of one book get one stable id
+            id: "\(normalizedBookWordKey(text: text, language: lang))_\(bookTitle)_\(bookAuthors)",
+            databaseId: id,
+            databaseIds: [id],
+            databaseStatuses: [id: status],
+            text: text,
+            language: lang,
+            status: status,
+            usage: usage,
+            allUsages: [WordUsage(text: usage, timestamp: ts)],
+            usageCount: Int(row[11] as! Int64),
+            bookId: row[7] as? String,
+            bookTitle: bookTitle,
+            bookAuthors: bookAuthors,
+            timestamp: ts,
+            stemOtherBookCount: Int(row[10] as! Int64)
+        )
+    }
+    
+    // Sort: Learning first, then Mastered, then Ignored; newest first within each group
+    private static let statusOrderClause = """
+     ORDER BY CASE W.category
+        WHEN 0 THEN 0
+        WHEN 100 THEN 1
+        WHEN -1 THEN 2
+        ELSE 1
+     END, latest_ts DESC
+    """
+
+    // SQL literal for LIKE '%text%', with quotes and the LIKE wildcards % and _ escaped
+    static func containsPattern(_ text: String) -> String {
+        let escaped = text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%")
+            .replacingOccurrences(of: "_", with: "\\_")
+            .replacingOccurrences(of: "'", with: "''")
+        return "'%\(escaped)%' ESCAPE '\\'"
+    }
     
     func fetchWords(for bookId: String?, search: String = "") {
-        guard let db = db else { return }
-        
         let isShortSearch = !search.isEmpty && search.count < 3
-        let relatedWordsEnabled = UserDefaults.standard.object(forKey: "enableRelatedWords") == nil
-            || UserDefaults.standard.bool(forKey: "enableRelatedWords")
+        let relatedWordsEnabled = UserDefaults.standard.bool(forKey: "enableRelatedWords")
         var selectedBookTitle: String? = nil
         var selectedBookAuthors: String? = nil
-        if let bookId = bookId {
-            let resolve = {
-                if let book = self.books.first(where: { $0.id == bookId }) {
-                    selectedBookTitle = book.title
-                    selectedBookAuthors = book.authors
-                }
-            }
-            if Thread.isMainThread {
-                resolve()
-            } else {
-                DispatchQueue.main.sync(execute: resolve)
-            }
+        // Called from the UI only; `books` is main-thread state.
+        if let bookId, let book = books.first(where: { $0.id == bookId }) {
+            selectedBookTitle = book.title
+            selectedBookAuthors = book.authors
         }
         
         // Cancel any in-flight fetch to avoid queue backlog
         fetchWordsWorkItem?.cancel()
         var workItem: DispatchWorkItem!
         workItem = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
+            guard let self, let db = self.db else { return }
             if workItem.isCancelled { return }
             
             do {
@@ -616,7 +644,8 @@ class DatabaseManager: ObservableObject {
                 """)
 
                 if relatedWordsEnabled {
-                    if let _ = bookFilterClause {
+                    // With a book open, only count stems that occur in that book.
+                    if bookFilterClause != nil {
                         withParts.append("""
                         book_stems AS (
                             SELECT DISTINCT W.stem AS stem
@@ -626,27 +655,19 @@ class DatabaseManager: ObservableObject {
                               AND L.book_key IN (SELECT id FROM book_filter)
                         )
                         """)
-                        withParts.append("""
-                        stem_book_counts AS (
-                            SELECT W.stem AS stem, COUNT(DISTINCT L.book_key) AS book_count
-                            FROM WORDS W
-                            JOIN LOOKUPS L ON L.word_key = W.id
-                            JOIN book_stems BS ON BS.stem = W.stem
-                            WHERE W.stem IS NOT NULL AND W.stem != ''
-                            GROUP BY W.stem
-                        )
-                        """)
-                    } else {
-                        withParts.append("""
-                        stem_book_counts AS (
-                            SELECT W.stem AS stem, COUNT(DISTINCT L.book_key) AS book_count
-                            FROM WORDS W
-                            JOIN LOOKUPS L ON L.word_key = W.id
-                            WHERE W.stem IS NOT NULL AND W.stem != ''
-                            GROUP BY W.stem
-                        )
-                        """)
                     }
+                    let bookStemsJoin = bookFilterClause != nil ? "JOIN book_stems BS ON BS.stem = W.stem" : ""
+                    withParts.append("""
+                    stem_book_counts AS (
+                        SELECT W.stem AS stem, COUNT(DISTINCT SB.title || '_' || SB.authors) AS book_count
+                        FROM WORDS W
+                        JOIN LOOKUPS L ON L.word_key = W.id
+                        JOIN BOOK_INFO SB ON SB.id = L.book_key
+                        \(bookStemsJoin)
+                        WHERE W.stem IS NOT NULL AND W.stem != ''
+                        GROUP BY W.stem
+                    )
+                    """)
                 }
 
                 let withClause = "WITH " + withParts.joined(separator: ",\n")
@@ -680,9 +701,9 @@ class DatabaseManager: ObservableObject {
                 var conditions: [String] = []
                 
                 if !search.isEmpty {
-                    let sanitizedSearch = search.lowercased().replacingOccurrences(of: "'", with: "''")
+                    let lowerSearch = search.lowercased()
                     var wordConditions: [String] = [
-                        "W.word LIKE '%\(sanitizedSearch)%'"
+                        "W.word LIKE \(Self.containsPattern(lowerSearch))"
                     ]
 
                     let stems = self.englishStemCandidatesIfEnabled(for: search)
@@ -690,14 +711,14 @@ class DatabaseManager: ObservableObject {
                         let sanitizedStem = stem.replacingOccurrences(of: "'", with: "''")
                         wordConditions.append("W.stem = '\(sanitizedStem)'")
                         // Fallback to word matching on stem in case the DB stem differs from our lemmatizer
-                        wordConditions.append("W.word LIKE '%\(sanitizedStem)%'")
+                        wordConditions.append("W.word LIKE \(Self.containsPattern(stem))")
                     }
 
                     let usageCondition = """
                     EXISTS (
                         SELECT 1 FROM LOOKUPS LU
                         WHERE LU.word_key = W.id AND LU.book_key = B.id
-                        AND LU.usage LIKE '%\(sanitizedSearch)%'
+                        AND LU.usage LIKE \(Self.containsPattern(lowerSearch))
                     )
                     """
                     conditions.append("(\(wordConditions.joined(separator: " OR ")) OR \(usageCondition))")
@@ -709,15 +730,7 @@ class DatabaseManager: ObservableObject {
                 
                 // Group to ensure unique word-book pairs (in case multiple lookups share same timestamp)
                 sql += " GROUP BY W.id, B.id"
-                // Sort: Learning first, then Mastered, then Ignored; newest first within each group
-                sql += """
-                 ORDER BY CASE W.category
-                    WHEN 0 THEN 0
-                    WHEN 100 THEN 1
-                    WHEN -1 THEN 2
-                    ELSE 1
-                 END, latest_ts DESC
-                """
+                sql += Self.statusOrderClause
                 
                 if !search.isEmpty {
                     sql += " LIMIT \(isShortSearch ? 100 : 500)"
@@ -729,42 +742,7 @@ class DatabaseManager: ObservableObject {
                 
                 for row in try db.prepare(sql) {
                     if workItem.isCancelled { return }
-                    let id = row[0] as! String
-                    let text = row[1] as! String
-                    let stem = row[2] as? String
-                    let lang = row[3] as! String
-                    let cat = Int(row[4] as! Int64)
-                    let usage = row[5] as! String
-                    let ts = row[6] as! Int64
-                    let bId = row[7] as! String
-                    let bTitle = row[8] as! String
-                    let bAuthors = row[9] as! String
-                    let stemOtherBookCount = Int(row[10] as! Int64)
-                    let usageCount = Int(row[11] as! Int64)
-                    
-                    let status = WordStatus(rawValue: cat) ?? .learning
-                    let preferred = preferredUsages[id]
-                    let uiId = "\(self.normalizedBookWordKey(text: text, language: lang))_\(bId)"
-                    
-                    let newWord = Word(
-                        id: uiId,
-                        databaseId: id,
-                        databaseIds: [id],
-                        databaseStatuses: [id: status],
-                        text: text,
-                        stem: stem,
-                        language: lang,
-                        status: status,
-                        usage: preferred ?? usage,
-                        allUsages: [WordUsage(text: usage, timestamp: ts)],
-                        usageCount: usageCount,
-                        bookId: bId,
-                        bookTitle: bTitle,
-                        bookAuthors: bAuthors,
-                        timestamp: ts,
-                        stemOtherBookCount: stemOtherBookCount
-                    )
-                    rawWords.append(newWord)
+                    rawWords.append(self.makeWord(row))
                 }
 
                 let finalWords = self.mergeCaseVariants(rawWords, preferredUsages: preferredUsages)
@@ -788,22 +766,24 @@ class DatabaseManager: ObservableObject {
     }
     
     func fetchUsages(for word: Word) {
-        guard let db = db, let bookId = word.bookId else { return }
+        guard let bookTitle = word.bookTitle, let bookAuthors = word.bookAuthors else { return }
         dbQueue.async {
+            guard let db = self.db else { return }
             do {
-                let targetIds = word.databaseIds.isEmpty ? [word.databaseId] : word.databaseIds
-                let quotedIds = targetIds.map { "'\($0.replacingOccurrences(of: "'", with: "''"))'" }.joined(separator: ", ")
-                let safeBookId = bookId.replacingOccurrences(of: "'", with: "''")
+                let targetIds = word.allDatabaseIds
+                let placeholders = Array(repeating: "?", count: targetIds.count).joined(separator: ", ")
+                // Match the book by title + authors so duplicate BOOK_INFO rows of one book are included.
                 let sql = """
                 SELECT L.usage, L.timestamp
                 FROM LOOKUPS L
-                WHERE L.word_key IN (\(quotedIds)) AND L.book_key = '\(safeBookId)'
+                JOIN BOOK_INFO B ON B.id = L.book_key
+                WHERE L.word_key IN (\(placeholders)) AND B.title = ? AND B.authors = ?
                 ORDER BY L.timestamp DESC
                 """
                 
                 var usages: [WordUsage] = []
                 var seenTexts = Set<String>()
-                for row in try db.prepare(sql) {
+                for row in try db.prepare(sql, targetIds.map { $0 as Binding? } + [bookTitle, bookAuthors]) {
                     let text = row[0] as! String
                     let ts = row[1] as! Int64
                     // Keep only the latest timestamp per identical usage text.
@@ -824,12 +804,10 @@ class DatabaseManager: ObservableObject {
     }
 
     func fetchStemMatches(for word: Word, completion: @escaping ([Word]) -> Void) {
-        let sanitizedBookId = word.bookId?.replacingOccurrences(of: "'", with: "''")
         stemQueue.async { [weak self] in
             guard let self = self else { return }
             do {
-                let dbUrl = try self.getPersistentStoreURL()
-                let stemDb = try Connection(dbUrl.path, readonly: true)
+                let stemDb = try Connection(self.storeURL.path, readonly: true)
                 stemDb.busyTimeout = 5
 
                 // Prefer the DB stem for this word id to avoid inconsistencies.
@@ -838,7 +816,7 @@ class DatabaseManager: ObservableObject {
                     dbStem = row[0] as? String
                 }
 
-                    let derivedCandidates = self.englishStemCandidatesIfEnabled(for: word.text)
+                let derivedCandidates = self.englishStemCandidatesIfEnabled(for: word.text)
                 let candidates = Array(Set(derivedCandidates)).filter { $0.count >= 3 }
 
                 let cleanDbStem = dbStem?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -847,16 +825,10 @@ class DatabaseManager: ObservableObject {
                     return
                 }
 
-                var stemPredicateParts: [String] = []
-                if let cleanDbStem, !cleanDbStem.isEmpty {
-                    let sanitizedStem = cleanDbStem.replacingOccurrences(of: "'", with: "''")
-                    stemPredicateParts.append("LOWER(W.stem) = LOWER('\(sanitizedStem)')")
-                }
-                for stem in candidates where stem != cleanDbStem?.lowercased() {
-                    let sanitizedStem = stem.replacingOccurrences(of: "'", with: "''")
-                    stemPredicateParts.append("LOWER(W.stem) = LOWER('\(sanitizedStem)')")
-                }
-                let stemPredicates = stemPredicateParts.joined(separator: " OR ")
+                var stems = candidates.filter { $0 != cleanDbStem?.lowercased() }
+                if let cleanDbStem, !cleanDbStem.isEmpty { stems.insert(cleanDbStem, at: 0) }
+                // COLLATE NOCASE matches idx_words_stem_nocase, so this is an index lookup
+                let stemPredicates = stems.map { _ in "W.stem = ? COLLATE NOCASE" }.joined(separator: " OR ")
 
                 var sql = """
                 SELECT
@@ -870,6 +842,7 @@ class DatabaseManager: ObservableObject {
                      FROM LOOKUPS L3
                      WHERE L3.word_key = W.id AND L3.book_key = B.id) as latest_ts,
                     B.id as book_id, B.title as book_title, B.authors as book_authors,
+                    0 as stem_other_book_count,
                     (SELECT COUNT(*)
                      FROM LOOKUPS L4
                      WHERE L4.word_key = W.id AND L4.book_key = B.id) as usage_count
@@ -879,60 +852,14 @@ class DatabaseManager: ObservableObject {
                 WHERE (\(stemPredicates))
                 """
 
-                if let bookId = sanitizedBookId {
-                    sql += " AND B.id != '\(bookId)'"
-                }
+                // Exclude this word's own book, including its duplicate BOOK_INFO rows.
+                sql += " AND NOT (B.title = ? AND B.authors = ?)"
+                sql += " GROUP BY W.id, B.id" + Self.statusOrderClause
 
-                sql += """
-                 GROUP BY W.id, B.id
-                 ORDER BY CASE W.category
-                    WHEN 0 THEN 0
-                    WHEN 100 THEN 1
-                    WHEN -1 THEN 2
-                    ELSE 1
-                 END, latest_ts DESC
-                """
-
-                var results: [Word] = []
-                for row in try stemDb.prepare(sql) {
-                    let id = row[0] as! String
-                    let text = row[1] as! String
-                    let stem = row[2] as? String
-                    let lang = row[3] as! String
-                    let cat = Int(row[4] as! Int64)
-                    let usage = row[5] as! String
-                    let ts = row[6] as! Int64
-                    let bId = row[7] as! String
-                    let bTitle = row[8] as! String
-                    let bAuthors = row[9] as! String
-                    let usageCount = Int(row[10] as! Int64)
-
-                    let status = WordStatus(rawValue: cat) ?? .learning
-                    let uiId = "\(self.normalizedBookWordKey(text: text, language: lang))_\(bId)"
-
-                    results.append(Word(
-                        id: uiId,
-                        databaseId: id,
-                        databaseIds: [id],
-                        databaseStatuses: [id: status],
-                        text: text,
-                        stem: stem,
-                        language: lang,
-                        status: status,
-                        usage: usage,
-                        allUsages: [WordUsage(text: usage, timestamp: ts)],
-                        usageCount: usageCount,
-                        bookId: bId,
-                        bookTitle: bTitle,
-                        bookAuthors: bAuthors,
-                        timestamp: ts,
-                        stemOtherBookCount: 0
-                    ))
-                }
-
-                DispatchQueue.main.async {
-                    completion(self.mergeCaseVariants(results, preferredUsages: [:]))
-                }
+                let bindings: [Binding?] = stems + [word.bookTitle ?? "", word.bookAuthors ?? ""]
+                let results = try stemDb.prepare(sql, bindings).map(self.makeWord)
+                let merged = self.mergeCaseVariants(results, preferredUsages: [:])
+                DispatchQueue.main.async { completion(merged) }
             } catch {
                 print("Error fetching stem matches: \(error)")
                 DispatchQueue.main.async { completion([]) }
@@ -940,111 +867,76 @@ class DatabaseManager: ObservableObject {
         }
     }
     
-    func updateStatus(word: Word, newStatus: WordStatus) {
-        updateStatus(words: [word], newStatus: newStatus)
+    func updateStatus(words: [Word], newStatus: WordStatus) {
+        updateStatuses(words.map { ($0, newStatus) })
     }
     
-    func updateStatus(words: [Word], newStatus: WordStatus, underscore: Bool = true) {
-        // Capture old statuses for undo
-        let changes = words.flatMap { word in
-            word.databaseStatuses.map { ($0.key, $0.value) }
+    // Applies all changes as one undo step.
+    func updateStatuses(_ changes: [(word: Word, status: WordStatus)]) {
+        guard !changes.isEmpty else { return }
+        var oldStatuses: [String: WordStatus] = [:]
+        var newStatuses: [String: WordStatus] = [:]
+        for (word, status) in changes {
+            for id in word.allDatabaseIds {
+                // The same WORDS.id can sit in several rows (one per book); keep its first old status.
+                oldStatuses[id] = oldStatuses[id] ?? word.databaseStatuses[id] ?? word.status
+                newStatuses[id] = status
+            }
         }
-        if underscore {
-            undoStack.append(UndoAction(changes: changes))
-        }
-        
-        guard let db = db else { return }
-        
-        let newCategory = newStatus.rawValue
-        let dbIds = Array(Set(words.flatMap { $0.databaseIds.isEmpty ? [$0.databaseId] : $0.databaseIds }))
-        let uiIds = words.map { $0.id }
-        
+        undoStack.append(UndoAction(changes: oldStatuses))
+        writeStatuses(newStatuses)
+    }
+    
+    func undoLastAction() {
+        guard let lastAction = undoStack.popLast() else { return }
+        writeStatuses(lastAction.changes)
+    }
+    
+    private func writeStatuses(_ statuses: [String: WordStatus]) {
         dbQueue.async { [weak self] in
-            guard let self = self else { return }
+            guard let self, let db = self.db else { return }
             do {
-                let targetWords = self.wordsTable.filter(dbIds.contains(self.w_id))
-                try db.run(targetWords.update(self.w_category <- newCategory))
-                
-                // Update local state
-                DispatchQueue.main.async {
-                    for (i, w) in self.words.enumerated() {
-                        if uiIds.contains(w.id) {
-                            var updatedWord = w
-                            updatedWord.status = newStatus
-                            for id in updatedWord.databaseIds.isEmpty ? [updatedWord.databaseId] : updatedWord.databaseIds {
-                                updatedWord.databaseStatuses[id] = newStatus
-                            }
-                            self.words[i] = updatedWord
-                        }
+                try db.transaction {
+                    // Group by status to minimize DB calls
+                    for (status, items) in Dictionary(grouping: statuses, by: { $0.value }) {
+                        let ids = items.map { $0.key }
+                        try db.run(self.wordsTable.filter(ids.contains(self.w_id)).update(self.w_category <- status.rawValue))
                     }
+                }
+                
+                DispatchQueue.main.async {
+                    // Update every row sharing a changed WORDS.id: status is shared across books.
+                    var updated = self.words
+                    for i in updated.indices {
+                        let matchedIds = updated[i].allDatabaseIds.filter { statuses[$0] != nil }
+                        guard !matchedIds.isEmpty else { continue }
+                        for id in matchedIds {
+                            updated[i].databaseStatuses[id] = statuses[id]
+                        }
+                        updated[i].status = self.mergedStatus(from: Array(updated[i].databaseStatuses.values))
+                    }
+                    self.words = updated
                     
                     // Refresh book list to update isMastered status
                     self.fetchBooks()
                 }
             } catch {
                 print("Failed to update status: \(error)")
-            }
-        }
-    }
-    func undoLastAction() {
-        guard let lastAction = undoStack.popLast() else { return }
-        
-        guard let db = db else { return }
-        
-        dbQueue.async { [weak self] in
-            guard let self = self else { return }
-            do {
-                // Group by status to minimize DB calls
-                let changesByStatus = Dictionary(grouping: lastAction.changes, by: { $0.oldStatus })
-                
-                for (status, items) in changesByStatus {
-                    let ids = items.map { $0.wordId }
-                    let newCategory = status.rawValue
-                    let targetWords = self.wordsTable.filter(ids.contains(self.w_id))
-                    try db.run(targetWords.update(self.w_category <- newCategory))
-                }
-                
-                // Update local state
                 DispatchQueue.main.async {
-                    _ = lastAction.changes.map { $0.wordId }
-                    let idToStatus = Dictionary(uniqueKeysWithValues: lastAction.changes)
-                    
-                    for (i, w) in self.words.enumerated() {
-                        let matchedIds = (w.databaseIds.isEmpty ? [w.databaseId] : w.databaseIds).filter { idToStatus[$0] != nil }
-                        if !matchedIds.isEmpty {
-                            var updatedWord = w
-                            for id in matchedIds {
-                                updatedWord.databaseStatuses[id] = idToStatus[id]
-                            }
-                            updatedWord.status = self.mergedStatus(from: Array(updatedWord.databaseStatuses.values))
-                            self.words[i] = updatedWord
-                        }
-                    }
-                    
-                    // Refresh book list to update isMastered status
-                    self.fetchBooks()
+                    self.appError = .dbError(error.localizedDescription)
                 }
-            } catch {
-                print("Failed to undo: \(error)")
             }
         }
     }
     
     // MARK: - Preferred Usage Persistence
     
-    func savePreferredUsage(wordId: String, usage: String) {
-        // Here wordId is the databaseId
-        saveSetting(key: "pref_usage_\(wordId)", value: usage)
+    func savePreferredUsage(for word: Word, usage: String) {
+        saveSetting(key: "pref_usage_\(Self.preferredUsageKey(wordId: word.databaseId, bookKey: word.bookKey))", value: usage)
         
-        // Update local memory immediately if possible
-        // We look for any word instance with this databaseId
-        for i in words.indices {
-            let ids = words[i].databaseIds.isEmpty ? [words[i].databaseId] : words[i].databaseIds
-            if ids.contains(wordId) {
-                var updatedWord = words[i]
-                updatedWord.usage = usage
-                words[i] = updatedWord
-            }
+        // Update local memory immediately: same word, same book only
+        for i in words.indices where words[i].bookKey == word.bookKey && words[i].allDatabaseIds.contains(word.databaseId) {
+            words[i].usage = usage
         }
     }
     
@@ -1072,26 +964,26 @@ class DatabaseManager: ObservableObject {
     }
     
     func clearDatabase() {
-        // Close connection
-        db = nil
-        stemDb = nil
-        
-        do {
-            let url = try getPersistentStoreURL()
-            if FileManager.default.fileExists(atPath: url.path) {
-                try FileManager.default.removeItem(at: url)
-            }
+        undoStack.removeAll() // old ids would rewrite statuses in the next imported library
+        // On the DB queue so no queued work runs against the deleted file
+        dbQueue.async {
+            self.db = nil
             
-            DispatchQueue.main.async {
-                self.books = []
-                self.words = []
-                self.isDatabaseLoaded = false
-                self.errorMessage = nil
-            }
-        } catch {
-            print("Failed to clear database: \(error)")
-            DispatchQueue.main.async {
-                self.errorMessage = "Failed to clear database: \(error)"
+            do {
+                if FileManager.default.fileExists(atPath: self.storeURL.path) {
+                    try FileManager.default.removeItem(at: self.storeURL)
+                }
+                
+                DispatchQueue.main.async {
+                    self.books = []
+                    self.words = []
+                    self.isDatabaseLoaded = false
+                }
+            } catch {
+                print("Failed to clear database: \(error)")
+                DispatchQueue.main.async {
+                    self.appError = .dbError("Failed to clear database: \(error.localizedDescription)")
+                }
             }
         }
     }

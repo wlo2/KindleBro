@@ -7,12 +7,10 @@ private let sidebarHeaderTrailingInset: CGFloat = 12
 
 struct ContentView: View {
     @EnvironmentObject var dbManager: DatabaseManager
-    @Environment(\.openWindow) private var openWindow
     
-    @State private var selectedBook: Book?
+    // By id: Book values change whenever their counts do, which would drop a value-based selection.
+    @State private var selectedBookId: Book.ID?
     @State private var searchText = ""
-    @State private var showImportPicker = false
-    @State private var documentToExport: SQLiteFile?
     @State private var selectedWordIds = Set<Word.ID>()
     @State private var toastMessage: String?
     @State private var bookSearchText = ""
@@ -20,16 +18,7 @@ struct ContentView: View {
     @State private var booksCollapsed = false
     
     // Modify Prompt Feature
-    @AppStorage("customPrompt") private var customPrompt = """
-For a given set of words and usage samples, generate RemNote flashcards in the following format:
-
-word>>3 most frequent translations, ordered by descending frequency, with the most frequent translation wrapped in **bold**. After the translations, add a usage sample enclosed in backticks (``). At least one translation must be derived from the provided usage. If a word has fewer than three frequent translations, list only the available ones.
-Each flashcard must be on a new line. Do not add any text, comments, or explanations — output **only** the generated flashcards.
-
-Example:
-test>>**translation1**, translation2, translation3 `Usage example`
-"""
-    @State private var showPromptEditor = false
+    @AppStorage("customPrompt") private var customPrompt = defaultPrompt
     
     // Settings
     @AppStorage("autoMasterOnCopy") private var autoMasterOnCopy = true
@@ -44,9 +33,13 @@ test>>**translation1**, translation2, translation3 `Usage example`
     // Search & Navigation Navigation State
     @State private var wordIdToSelectAfterBookChange: String? = nil
     @State private var navigatingFromSearch = false
+    // Hides the list while a jump loads another book, so it appears already scrolled to the word.
+    @State private var hideListForJump = false
     @State private var scrollRequest: UUID? = nil
     @State private var lastScrolledId: String? = nil
     @State private var searchTask: Task<Void, Never>?
+    
+    private var selectedBook: Book? { dbManager.books.first { $0.id == selectedBookId } }
     
     var body: some View {
         NavigationSplitView {
@@ -54,8 +47,8 @@ test>>**translation1**, translation2, translation3 `Usage example`
         } detail: {
             detailView
         }
-        .fileImporter(isPresented: $showImportPicker, allowedContentTypes: [.data]) { handleImport($0) }
-        .fileExporter(isPresented: $dbManager.showExportPicker, document: documentToExport, contentType: .data, defaultFilename: "vocab.db") { handleExport($0) }
+        .fileImporter(isPresented: $dbManager.showImportPicker, allowedContentTypes: [.data]) { handleImport($0) }
+        .fileExporter(isPresented: $dbManager.showExportPicker, document: SQLiteFile(), contentType: .data, defaultFilename: "vocab.db") { handleExport($0) }
         .alert("Clear Database?", isPresented: $dbManager.showClearConfirmation) {
             Button("Clear", role: .destructive) { dbManager.clearDatabase() }
             Button("Cancel", role: .cancel) { }
@@ -70,7 +63,7 @@ test>>**translation1**, translation2, translation3 `Usage example`
         .onChange(of: dbManager.books) { _, _ in
             restoreLastSelectedBook()
         }
-        .onChange(of: selectedBook) { _, _ in handleBookChange() }
+        .onChange(of: selectedBookId) { _, _ in handleBookChange() }
         .onChange(of: searchText) { _, _ in handleSearchChange() }
         .onChange(of: selectedWordIds) { oldValue, newValue in
             handleSelection(oldValue: oldValue, newValue: newValue)
@@ -78,14 +71,14 @@ test>>**translation1**, translation2, translation3 `Usage example`
         .onChange(of: dbManager.words) { _, newValue in
             handleDataLoaded(newValue)
         }
-        .onChange(of: customPrompt) { _, newValue in
-            dbManager.saveSetting(key: "customPrompt", value: newValue)
-        }
+        // Both settings change what the word query returns
+        .onChange(of: enableRelatedWords) { _, _ in refreshWords() }
+        .onChange(of: enableStemSearch) { _, _ in refreshWords() }
     }
     
     @ViewBuilder
     private var sidebarView: some View {
-        List(selection: $selectedBook) {
+        List(selection: $selectedBookId) {
             if enableCompletedBooks {
                 let filtered = bookSearchText.isEmpty
                     ? dbManager.books
@@ -97,76 +90,30 @@ test>>**translation1**, translation2, translation3 `Usage example`
                     Section {
                         if !booksCollapsed || !bookSearchText.isEmpty {
                             ForEach(activeBooks) { book in
-                                NavigationLink(value: book) { BookRow(book: book) }
+                                NavigationLink(value: book.id) { BookRow(book: book) }
                             }
                         }
                     } header: {
-                        HStack(spacing: 8) {
-                            Label("Books", systemImage: "books.vertical")
-                            Spacer()
-                            Text("\(activeBooks.count)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .frame(minWidth: 18, alignment: .trailing)
-                            Button(action: { booksCollapsed.toggle() }) {
-                                Image(systemName: booksCollapsed ? "chevron.right" : "chevron.down")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .frame(width: sidebarTrailingColumnWidth, alignment: .trailing)
-                                    .padding(.trailing, sidebarTrailingColumnPadding)
-                                    .padding(.vertical, 2)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(!bookSearchText.isEmpty)
-                            .help(bookSearchText.isEmpty
-                                  ? (booksCollapsed ? "Show books" : "Hide books")
-                                  : "Search is active")
-                        }
-                        .font(.title3)
-                        .padding(.vertical, 10)
-                        .padding(.trailing, sidebarHeaderTrailingInset)
+                        sectionHeader("Books", icon: "books.vertical", count: activeBooks.count, collapsed: $booksCollapsed)
                     }
+                    .collapsible(false) // we draw our own chevron; the system one shifted the header on hover
                 }
 
                 if !completedBooks.isEmpty {
                     Section {
                         if !completedCollapsed || !bookSearchText.isEmpty {
                             ForEach(completedBooks) { book in
-                                NavigationLink(value: book) { BookRow(book: book, showStrikethrough: false) }
+                                NavigationLink(value: book.id) { BookRow(book: book, showStrikethrough: false) }
                             }
                         }
                     } header: {
-                        HStack(spacing: 8) {
-                            Label("Completed", systemImage: "checkmark.circle")
-                            Spacer()
-                            Text("\(completedBooks.count)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .frame(minWidth: 18, alignment: .trailing)
-                            Button(action: { completedCollapsed.toggle() }) {
-                                Image(systemName: completedCollapsed ? "chevron.right" : "chevron.down")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                                    .frame(width: sidebarTrailingColumnWidth, alignment: .trailing)
-                                    .padding(.trailing, sidebarTrailingColumnPadding)
-                                    .padding(.vertical, 2)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .disabled(!bookSearchText.isEmpty)
-                            .help(bookSearchText.isEmpty
-                                  ? (completedCollapsed ? "Show completed books" : "Hide completed books")
-                                  : "Search is active")
-                        }
-                        .font(.title3)
-                        .padding(.vertical, 10)
-                        .padding(.trailing, sidebarHeaderTrailingInset)
+                        sectionHeader("Completed", icon: "checkmark.circle", count: completedBooks.count, collapsed: $completedCollapsed)
                     }
+                    .collapsible(false) // we draw our own chevron; the system one shifted the header on hover
                 }
             } else {
                 ForEach(bookSearchText.isEmpty ? dbManager.books : dbManager.books.filter { $0.title.localizedCaseInsensitiveContains(bookSearchText) }) { book in
-                    NavigationLink(value: book) { BookRow(book: book) }
+                    NavigationLink(value: book.id) { BookRow(book: book) }
                 }
             }
         }
@@ -174,10 +121,37 @@ test>>**translation1**, translation2, translation3 `Usage example`
         .navigationSplitViewColumnWidth(min: 200, ideal: 250)
         .toolbar {
             ToolbarItemGroup(placement: .automatic) {
-                Button(action: syncKindle) { Image(systemName: "arrow.triangle.2.circlepath") }.help("Sync Kindle")
-                Button(action: { showImportPicker = true }) { Image(systemName: "square.and.arrow.down") }.help("Import DB")
+                Button(action: syncKindle) { Label("Sync Kindle", systemImage: "arrow.triangle.2.circlepath") }.help("Sync Kindle")
             }
         }
+    }
+    
+    private func sectionHeader(_ title: String, icon: String, count: Int, collapsed: Binding<Bool>) -> some View {
+        HStack(spacing: 8) {
+            Label(title, systemImage: icon)
+            Spacer()
+            Text("\(count)")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(minWidth: 18, alignment: .trailing)
+            Button(action: { collapsed.wrappedValue.toggle() }) {
+                Image(systemName: collapsed.wrappedValue ? "chevron.right" : "chevron.down")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .frame(width: sidebarTrailingColumnWidth, alignment: .trailing)
+                    .padding(.trailing, sidebarTrailingColumnPadding)
+                    .padding(.vertical, 2)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!bookSearchText.isEmpty)
+            .help(bookSearchText.isEmpty
+                  ? "\(collapsed.wrappedValue ? "Show" : "Hide") \(title.lowercased())"
+                  : "Search is active")
+        }
+        .font(.title3)
+        .padding(.vertical, 10)
+        .padding(.trailing, sidebarHeaderTrailingInset)
     }
     
     @ViewBuilder
@@ -190,10 +164,9 @@ test>>**translation1**, translation2, translation3 `Usage example`
             scrollRequest: $scrollRequest,
             lastScrolledId: $lastScrolledId,
             toastMessage: toastMessage,
-            customPrompt: $customPrompt,
-            showPromptEditor: $showPromptEditor,
+            hideList: hideListForJump,
             enableRelatedWords: enableRelatedWords,
-            onImport: { showImportPicker = true },
+            onImport: { dbManager.showImportPicker = true },
             onStatusUpdate: { dbManager.updateStatus(word: $0, newStatus: $1, bulkIds: selectedWordIds) },
             onToast: { showToast(message: $0, duration: $1) },
             onBulkCopy: handleBulkCopy,
@@ -204,7 +177,6 @@ test>>**translation1**, translation2, translation3 `Usage example`
             onUndo: { dbManager.undoLastAction() },
             onRefresh: refreshWords,
             onPromptCopy: handlePromptCopy,
-            onGenerateFlashcards: handleGenerateFlashcards,
             onArrowKeyUpdate: handleArrowKeyStatusUpdate
         )
     }
@@ -216,31 +188,28 @@ test>>**translation1**, translation2, translation3 `Usage example`
         let selectedWords = dbManager.words.filter { selectedWordIds.contains($0.id) }
         guard !selectedWords.isEmpty else { return }
         
-        // Group words by their new status to perform efficient batch updates if possible,
-        // though DatabaseManager.updateStatus(words:newStatus:) is already efficient.
-        // Logic:
         // Right Arrow (target .mastered): .learning -> .mastered, .ignored -> .learning
         // Left Arrow (target .ignored): .learning -> .ignored, .mastered -> .learning
-        
-        for word in selectedWords {
-            var nextStatus = word.status
-            if targetStatus == .mastered {
-                if word.status == .learning { nextStatus = .mastered }
-                else if word.status == .ignored { nextStatus = .learning }
-            } else if targetStatus == .ignored {
-                if word.status == .learning { nextStatus = .ignored }
-                else if word.status == .mastered { nextStatus = .learning }
-            }
-            
-            if nextStatus != word.status {
-                dbManager.updateStatus(word: word, newStatus: nextStatus)
+        // One batch call so Undo reverts the whole key press.
+        let changes: [(word: Word, status: WordStatus)] = selectedWords.compactMap { word in
+            switch (targetStatus, word.status) {
+            case (.mastered, .learning): return (word, .mastered)
+            case (.mastered, .ignored), (.ignored, .mastered): return (word, .learning)
+            case (.ignored, .learning): return (word, .ignored)
+            default: return nil
             }
         }
+        guard !changes.isEmpty else { return }
+        dbManager.updateStatuses(changes)
         
-        showToast(message: "Status toggled for \(selectedWords.count) \(selectedWords.count == 1 ? "word" : "words")", duration: 1.5)
+        showToast(message: "Status toggled for \(changes.count) \(changes.count == 1 ? "word" : "words")", duration: 1.5)
     }
     
     private func handleOnAppear() {
+        if let backupError = UserDefaults.standard.string(forKey: "lastBackupError") {
+            UserDefaults.standard.removeObject(forKey: "lastBackupError")
+            dbManager.appError = .backupError("The backup on last quit failed: \(backupError)")
+        }
         if dbManager.isDatabaseLoaded {
             restoreLastSelectedBook()
             if let p = dbManager.getSetting(key: "customPrompt") { customPrompt = p }
@@ -249,45 +218,45 @@ test>>**translation1**, translation2, translation3 `Usage example`
     }
 
     private func restoreLastSelectedBook() {
-        if selectedBook == nil, !lastSelectedBookId.isEmpty {
-            if let b = dbManager.books.first(where: { $0.id == lastSelectedBookId }) {
-                selectedBook = b
-            }
+        if selectedBookId == nil, dbManager.books.contains(where: { $0.id == lastSelectedBookId }) {
+            selectedBookId = lastSelectedBookId
         }
     }
     
     private func handleImport(_ result: Result<URL, Error>) {
-        if case .success(let url) = result {
-            dbManager.importDatabase(from: url) { r in
-                if case .success(let c) = r { showToast(message: "Imported. \(c) words added", duration: 4.0) }
-            }
+        if case .success(let url) = result { importLibrary(from: url, toast: "Imported") }
+    }
+    
+    // Shared by Import and Sync. Failures are shown by DatabaseManager as an alert.
+    private func importLibrary(from url: URL, toast: String) {
+        dbManager.importDatabase(from: url) { r in
+            guard case .success(let c) = r else { return }
+            showToast(message: "\(toast). \(c) words added", duration: 4.0)
             if let p = dbManager.getSetting(key: "customPrompt") { customPrompt = p }
+            refreshWords() // new words for the open book
         }
     }
     
-    private func handleExport(_ result: Result<URL, Error>) { if case .failure(let e) = result { print("Export failed: \(e)") } }
-    
-    private func handleExportTrigger(_ val: Bool) {
-        if val {
-            dbManager.saveSetting(key: "customPrompt", value: customPrompt)
-            if let url = try? dbManager.getPersistentStoreURL(), let data = try? Data(contentsOf: url) { documentToExport = SQLiteFile(data: data) }
-            else { dbManager.showExportPicker = false }
+    private func handleExport(_ result: Result<URL, Error>) {
+        if case .failure(let e) = result, (e as? CocoaError)?.code != .userCancelled {
+            dbManager.appError = .dbError("Export failed: \(e.localizedDescription)")
         }
     }
+    
 
     private func handleBookChange() {
         if !navigatingFromSearch { searchText = "" }
         bookSearchText = "" // Clear book search on selection
         refreshWords()
         if wordIdToSelectAfterBookChange == nil { selectedWordIds.removeAll() }
-        if let id = selectedBook?.id { lastSelectedBookId = id }
+        if let selectedBookId { lastSelectedBookId = selectedBookId }
     }
     
     private func handleSearchChange() {
         if navigatingFromSearch { searchTask?.cancel(); return }
         searchTask?.cancel()
         searchTask = Task {
-            try? await Task.sleep(for: .milliseconds(500))
+            try? await Task.sleep(for: .milliseconds(250))
             if !Task.isCancelled { refreshWords(); selectedWordIds.removeAll() }
         }
     }
@@ -297,45 +266,45 @@ test>>**translation1**, translation2, translation3 `Usage example`
             lastScrolledId = f; scrollRequest = UUID()
             bookSearchText = "" // Clear book search when jumping to a word
         }
-        if !searchText.isEmpty && oldValue.isEmpty && newValue.count == 1, let sid = newValue.first {
-            if let w = dbManager.words.first(where: { $0.id == sid }), let t = w.bookTitle, let b = dbManager.books.first(where: { $0.title == t }) {
-                wordIdToSelectAfterBookChange = sid; navigatingFromSearch = true; searchText = ""
-                if selectedBook == b { dbManager.fetchWords(for: b.id, search: "") } else { selectedBook = b }
-            }
+        if !searchText.isEmpty && oldValue.isEmpty && newValue.count == 1, let sid = newValue.first,
+           let w = dbManager.words.first(where: { $0.id == sid }) {
+            navigateToBook(of: w)
         }
     }
     
     private func handleDataLoaded(_ words: [Word]) {
-        if let tid = wordIdToSelectAfterBookChange, words.contains(where: { $0.id == tid }) {
+        guard let tid = wordIdToSelectAfterBookChange else { return }
+        if words.contains(where: { $0.id == tid }) {
             // INSTANT STABILIZED SCROLL:
             // 1. Set selection immediately (triggering List update)
             selectedWordIds = [tid]
             lastScrolledId = tid
             
-            // 2. Wait 50ms for List layout to stabilize, then trigger jump
-            // This tiny delay ensures the List recognizes the target ID before we scroll
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            // 2. Scroll on the next main-loop turn: the List has its new rows by then.
+            // (Was a fixed 50 ms wait; the list is hidden meanwhile, so that wait was pure delay.)
+            DispatchQueue.main.async {
                 scrollRequest = UUID()
+                hideListForJump = false // same update as the scroll
             }
-            
-            // 3. Clear the target
-            wordIdToSelectAfterBookChange = nil
-            
-            // 4. Defer flag reset to prevent double-scroll
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                navigatingFromSearch = false
-            }
+        } else {
+            hideListForJump = false
+        }
+        // Clear the target even when the word is missing, so search never stays blocked.
+        wordIdToSelectAfterBookChange = nil
+        // Defer flag reset to prevent double-scroll
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            navigatingFromSearch = false
+            // Run any search typed while input was muted
+            if !searchText.isEmpty { handleSearchChange() }
         }
     }
 
-    private func refreshWords() { dbManager.fetchWords(for: searchText.isEmpty ? selectedBook?.id : nil, search: searchText) }
+    private func refreshWords() { dbManager.fetchWords(for: searchText.isEmpty ? selectedBookId : nil, search: searchText) }
     
     private func syncKindle() {
         let p = "/Volumes/Kindle/system/vocabulary/vocab.db"
         if FileManager.default.fileExists(atPath: p) {
-            dbManager.importDatabase(from: URL(fileURLWithPath: p)) { r in
-                if case .success(let c) = r { showToast(message: "Synced. \(c) words added", duration: 4.0) }
-            }
+            importLibrary(from: URL(fileURLWithPath: p), toast: "Synced")
         } else { showToast(message: "No device found", duration: 4.0) }
     }
     
@@ -345,10 +314,12 @@ test>>**translation1**, translation2, translation3 `Usage example`
     }
     
     private func handleCopyAll() {
+        let count = dbManager.words.filter { $0.status == .learning }.count
         let t = dbManager.formatAllLearning()
         if !t.isEmpty {
             NSPasteboard.general.clearContents(); NSPasteboard.general.setString("\(customPrompt)\n\n\(t)", forType: .string)
-            showToast(message: "Copied all learning words", duration: 2.5)
+            // The list is capped for "All Words" and search, so say how many were actually copied.
+            showToast(message: "Copied \(count) learning \(count == 1 ? "word" : "words")", duration: 2.5)
             if autoMasterOnCopy { dbManager.masterAllLearning() }
         } else { showToast(message: "No words to copy", duration: 2.5) }
     }
@@ -374,14 +345,6 @@ test>>**translation1**, translation2, translation3 `Usage example`
         }
     }
     
-    private func handleGenerateFlashcards() {
-        let t = dbManager.formatSelected(ids: selectedWordIds)
-        if !t.isEmpty {
-            openWindow(id: "generation", value: "\(customPrompt)\n\n\(t)")
-            if autoMasterOnCopy { dbManager.masterSelected(ids: selectedWordIds) }
-        }
-    }
-
     private func handleJumpToWord(_ word: Word) {
         if dbManager.words.contains(where: { $0.id == word.id }) {
             selectedWordIds = [word.id]
@@ -389,26 +352,25 @@ test>>**translation1**, translation2, translation3 `Usage example`
             scrollRequest = UUID()
             return
         }
+        navigateToBook(of: word)
+    }
 
+    private func navigateToBook(of word: Word) {
         wordIdToSelectAfterBookChange = word.id
         navigatingFromSearch = true
+        hideListForJump = true
+        // Never leave the list hidden if the book load fails
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { hideListForJump = false }
         searchText = ""
 
-        guard let title = word.bookTitle else { return }
-        if let authors = word.bookAuthors,
-           let book = dbManager.books.first(where: { $0.title == title && $0.authors == authors }) {
-            selectedBook = book
-        } else if let book = dbManager.books.first(where: { $0.title == title }) {
-            selectedBook = book
-        } else if let bookId = word.bookId {
+        // Match title + authors: different books can share a title.
+        let book = dbManager.books.first(where: { $0.title == word.bookTitle && $0.authors == word.bookAuthors })
+        if let book, book.id != selectedBookId {
+            selectedBookId = book.id
+        } else if let bookId = book?.id ?? word.bookId {
+            // Same book: selection does not change, so reload directly
             dbManager.fetchWords(for: bookId, search: "")
         }
-    }
-    
-    private func handleCopyCommand() -> [NSItemProvider] {
-        let t = dbManager.formatSelected(ids: selectedWordIds)
-        if !t.isEmpty { showToast(message: "Copied", duration: 2.5); return [NSItemProvider(object: t as NSString)] }
-        return []
     }
 
     private func showToast(message: String, duration: TimeInterval) {
@@ -462,7 +424,7 @@ struct WordListView: View {
                         onUpdateStatus: { onStatusUpdate(word, $0) },
                         onCopy: { onToast("Copied", 2.5) },
                         onContextCopy: onBulkCopy,
-                        onSelectUsage: { dbManager.savePreferredUsage(wordId: word.databaseId, usage: $0) },
+                        onSelectUsage: { dbManager.savePreferredUsage(for: word, usage: $0) },
                         onSelectAll: onSelectAll,
                         onCopyAll: onCopyAll,
                         onJumpToWord: onJumpToWord,
@@ -474,38 +436,10 @@ struct WordListView: View {
             }
             .onChange(of: scrollRequest) { _, newValue in
                 if newValue != nil, let tid = lastScrolledId {
-                    // INSTANT DIRECT SNAP:
-                    // No animation, no delay (optimizing for speed).
-                    // We rely on the 300ms pre-stabilization wait in handleDataLoaded 
-                    // to ensure the list is ready.
+                    // No animation: handleDataLoaded triggers this once the List has the target row.
                     proxy.scrollTo(tid, anchor: .center)
                 }
             }
-        }
-    }
-}
-
-struct SelectionStatusView: View {
-    let count: Int; let onSelectBatch: () -> Void; let onSelectAll: () -> Void; let onCopyAll: () -> Void
-    var body: some View {
-        if count > 1 { Text("\(count) selected").foregroundStyle(.secondary).font(.caption).padding(.horizontal, 8) }
-        else { HStack(spacing: 12) {
-            Button(action: onSelectBatch) { Image(systemName: "checkmark.circle") }.help("Select learning batch")
-            Button(action: onSelectAll) { Image(systemName: "checklist") }.help("Select all Learning words")
-            Button(action: onCopyAll) { Image(systemName: "doc.on.doc") }.help("Copy all Learning words")
-        }}
-    }
-}
-
-struct ActionToolbar: View {
-    @ObservedObject var dbManager: DatabaseManager; let hasSelection: Bool
-    let onUndo: () -> Void; let onRefresh: () -> Void; let onPromptCopy: () -> Void; let onGenerateFlashcards: () -> Void
-    var body: some View {
-        HStack {
-            Button(action: onUndo) { Image(systemName: "arrow.uturn.backward") }.help("Undo").disabled(dbManager.undoStack.isEmpty)
-            Button(action: onRefresh) { Image(systemName: "arrow.clockwise") }.help("Refresh list")
-            Button(action: onPromptCopy) { Image(systemName: "text.append") }.help("Copy with prompt").disabled(!hasSelection)
-            Button(action: onGenerateFlashcards) { Image(systemName: "sparkles") }.help("Generate flashcards").disabled(!hasSelection)
         }
     }
 }
@@ -518,8 +452,7 @@ struct DetailViewContent: View {
     @Binding var scrollRequest: UUID?
     @Binding var lastScrolledId: String?
     let toastMessage: String?
-    @Binding var customPrompt: String
-    @Binding var showPromptEditor: Bool
+    let hideList: Bool
     let enableRelatedWords: Bool
     
     let onImport: () -> Void
@@ -533,7 +466,6 @@ struct DetailViewContent: View {
     let onUndo: () -> Void
     let onRefresh: () -> Void
     let onPromptCopy: () -> Void
-    let onGenerateFlashcards: () -> Void
     let onArrowKeyUpdate: (WordStatus) -> Void
 
     var body: some View {
@@ -556,19 +488,27 @@ struct DetailViewContent: View {
                     onSelectAll: onSelectAll,
                     onCopyAll: onCopyAll
                 )
+                .opacity(hideList ? 0 : 1)
                 .navigationTitle(!searchText.isEmpty ? "Results" : (selectedBook?.title ?? "All Words"))
                 .searchable(text: $searchText, prompt: "Search words or usage...")
+                // Native toolbar items: one tooltip and one circular highlight per button,
+                // and Liquid Glass group capsules on macOS 26+.
                 .toolbar {
-                    ToolbarItem(placement: .status) { SelectionStatusView(count: selectedWordIds.count, onSelectBatch: onSelectBatch, onSelectAll: onSelectAll, onCopyAll: onCopyAll) }
-                    ToolbarItem(placement: .automatic) {
-                        ActionToolbar(
-                            dbManager: dbManager,
-                            hasSelection: !selectedWordIds.isEmpty,
-                            onUndo: onUndo,
-                            onRefresh: onRefresh,
-                            onPromptCopy: onPromptCopy,
-                            onGenerateFlashcards: onGenerateFlashcards
-                        )
+                    if selectedWordIds.count > 1 {
+                        ToolbarItem(placement: .status) {
+                            Text("\(selectedWordIds.count) selected").foregroundStyle(.secondary).font(.caption).padding(.horizontal, 8)
+                        }
+                    } else {
+                        ToolbarItemGroup(placement: .status) {
+                            Button(action: onSelectBatch) { Label("Select learning batch", systemImage: "checkmark.circle") }.help("Select learning batch")
+                            Button(action: onSelectAll) { Label("Select all Learning words", systemImage: "checklist") }.help("Select all Learning words")
+                            Button(action: onCopyAll) { Label("Copy all Learning words", systemImage: "doc.on.doc") }.help("Copy all Learning words")
+                        }
+                    }
+                    ToolbarItemGroup(placement: .automatic) {
+                        Button(action: onUndo) { Label("Undo", systemImage: "arrow.uturn.backward") }.help("Undo").disabled(dbManager.undoStack.isEmpty)
+                        Button(action: onRefresh) { Label("Refresh list", systemImage: "arrow.clockwise") }.help("Refresh list")
+                        Button(action: onPromptCopy) { Label("Copy with prompt", systemImage: "text.append") }.help("Copy with prompt").disabled(selectedWordIds.isEmpty)
                     }
                 }
                 .onCopyCommand {
@@ -582,7 +522,6 @@ struct DetailViewContent: View {
             }
             if let message = toastMessage { ToastView(message: message) }
         }
-        .sheet(isPresented: $showPromptEditor) { PromptEditorView(prompt: $customPrompt) }
         .onKeyPress(.rightArrow) {
             onArrowKeyUpdate(.mastered)
             return .handled
@@ -590,6 +529,18 @@ struct DetailViewContent: View {
         .onKeyPress(.leftArrow) {
             onArrowKeyUpdate(.ignored)
             return .handled
+        }
+        // Esc as a window-wide shortcut, so it works wherever focus is (after a search it stays
+        // in the toolbar search field, which onExitCommand on this view never sees).
+        // First Esc clears the selection, the next clears the search, like the search field itself.
+        .background {
+            Button("Clear selection") {
+                if !selectedWordIds.isEmpty { selectedWordIds.removeAll() } else { searchText = "" }
+            }
+            .keyboardShortcut(.cancelAction)
+            .frame(width: 0, height: 0)
+            .opacity(0)
+            .accessibilityHidden(true)
         }
     }
 }
@@ -599,11 +550,17 @@ struct ToastView: View {
     var body: some View { VStack { Spacer(); Text(message).font(.title2).padding(20).background(.regularMaterial).cornerRadius(12).shadow(radius: 8).padding(.bottom, 60).transition(.opacity) }.zIndex(1) }
 }
 
+// Export document. The snapshot is taken when the file is written, so it includes every change made so far.
 struct SQLiteFile: FileDocument {
     static var readableContentTypes = [UTType.database, UTType.data]
-    var data: Data?; init(data: Data) { self.data = data }
-    init(configuration: ReadConfiguration) throws { if let d = configuration.file.regularFileContents { self.data = d } }
-    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { return FileWrapper(regularFileWithContents: data ?? Data()) }
+    init() {}
+    init(configuration: ReadConfiguration) throws {}
+    func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper {
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("KindleBro-export.sqlite")
+        try? FileManager.default.removeItem(at: tmp)
+        try DatabaseManager.shared.backup(to: tmp)
+        return FileWrapper(regularFileWithContents: try Data(contentsOf: tmp))
+    }
 }
 
 extension DatabaseManager {
@@ -622,6 +579,6 @@ extension DatabaseManager {
     func masterSelected(ids: Set<Word.ID>) { updateStatus(words: words.filter { ids.contains($0.id) && $0.status != .mastered }, newStatus: .mastered) }
     func updateStatus(word: Word, newStatus: WordStatus, bulkIds: Set<Word.ID>) {
         if bulkIds.contains(word.id) { updateStatus(words: words.filter { bulkIds.contains($0.id) }, newStatus: newStatus) }
-        else { updateStatus(word: word, newStatus: newStatus) }
+        else { updateStatus(words: [word], newStatus: newStatus) }
     }
 }

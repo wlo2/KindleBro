@@ -21,5 +21,13 @@ let package = Package(
             ],
             path: "Sources"
         ),
+        .testTarget(
+            name: "KindleBroTests",
+            dependencies: [
+                "KindleBro",
+                .product(name: "SQLite", package: "SQLite.swift")
+            ],
+            path: "Tests/KindleBroTests"
+        ),
     ]
 )

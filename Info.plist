@@ -5,11 +5,11 @@
     <key>CFBundleExecutable</key>
     <string>KindleBro</string>
     <key>CFBundleIdentifier</key>
-    <string>com.example.KindleBro</string>
+    <string>io.github.wlo2.KindleBro</string>
     <key>CFBundleName</key>
     <string>KindleBro</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.2</string>
+    <string>1.3</string>
     <key>CFBundleVersion</key>
     <string>1</string>
     <key>CFBundlePackageType</key>
