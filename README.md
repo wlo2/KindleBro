@@ -7,7 +7,7 @@ KindleBro is a small native macOS app for Apple silicon that helps you work thro
 
 It is made mainly for advanced language learners who use spaced repetition (SRS). Reading fiction is one of the most efficient ways to collect new vocabulary.
 
-Inspired by [Kindle Mate](https://sourceforge.net/projects/kmate/). Free and open source.
+Inspired by [Kindle Mate](https://sourceforge.net/projects/kmate/). Free and open source under the [GPL-3.0](LICENSE).
 ![Main Screen](Main_screen.jpg)
 ## Features
 ### Kindle integration
