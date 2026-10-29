@@ -17,7 +17,7 @@ fi
 
 # 1. Build
 echo "Building..."
-swift build -c release -Xswiftc -D -Xswiftc APP_BUNDLE
+swift build -c release
 
 if [ $? -ne 0 ]; then
     echo "Build failed."

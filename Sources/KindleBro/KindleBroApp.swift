@@ -50,7 +50,7 @@ private struct AboutWindow: View {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "KindleBro"
     }
     private var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.5"
     }
     
     var body: some View {
@@ -122,7 +122,8 @@ struct KindleBroApp: App {
         // Registered here, not in a view, so it also runs when the main window is closed.
         // queue: nil runs it synchronously, before the app exits.
         NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: nil) { _ in
-            guard defaults.bool(forKey: "backupEnabled"),
+            // No library (e.g. after Clear Database): nothing to back up, and the old backup stays as it is.
+            guard DatabaseManager.shared.isDatabaseLoaded, defaults.bool(forKey: "backupEnabled"),
                   let location = defaults.string(forKey: "backupLocation"), !location.isEmpty else { return }
             do {
                 try DatabaseManager.shared.backup(to: URL(fileURLWithPath: location))

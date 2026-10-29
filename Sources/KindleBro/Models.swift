@@ -47,10 +47,6 @@ struct Word: Identifiable, Hashable {
         return Date(timeIntervalSince1970: TimeInterval(timestamp / 1000))
     }
     
-    var allDatabaseIds: [String] {
-        databaseIds.isEmpty ? [databaseId] : databaseIds
-    }
-
     // Duplicate BOOK_INFO rows of one book share this key
     var bookKey: String { "\(bookTitle ?? "")_\(bookAuthors ?? "")" }
 

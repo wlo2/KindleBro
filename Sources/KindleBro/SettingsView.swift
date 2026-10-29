@@ -116,7 +116,7 @@ struct SettingsView: View {
                     if !localBackupLocation.isEmpty && localBackupEnabled {
                         VStack(alignment: .leading, spacing: 4) {
                             Text("A full backup will be created immediately upon saving if settings changed.")
-                            Text("Incremental updates will be performed automatically every time the app is closed.")
+                            Text("After that, the whole library is copied again every time the app quits.")
                                 .bold()
                         }
                         .font(.caption)

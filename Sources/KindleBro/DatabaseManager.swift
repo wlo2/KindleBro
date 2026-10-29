@@ -322,9 +322,9 @@ class DatabaseManager: ObservableObject {
 
         let lower = trimmed.lowercased()
         // Russian: the dictionary form only ("слободы" finds "слободе" via lemma "слобода").
+        // Kept even when the search is that form: the stored lemma is what finds the other forms.
         if trimmed.range(of: "\\p{Cyrillic}", options: .regularExpression) != nil {
-            let lemma = Self.lemma(word: trimmed, language: "ru", kindleStem: nil, usage: nil)
-            return lemma == lower ? [] : [lemma]
+            return [Self.lemma(word: trimmed, language: "ru", kindleStem: nil, usage: nil)]
         }
         guard trimmed.range(of: "[A-Za-z]", options: .regularExpression) != nil else { return [] }
 
@@ -357,8 +357,6 @@ class DatabaseManager: ObservableObject {
             }
         }
 
-        // Drop the original search term to avoid redundant LIKEs.
-        candidates.remove(lower)
         return Array(candidates)
     }
 
@@ -466,11 +464,8 @@ class DatabaseManager: ObservableObject {
             let groupKey = "\(word.bookKey)|\(word.lemma)"
             let preferred = { (id: String) in preferredUsages[Self.preferredUsageKey(wordId: id, bookKey: word.bookKey)] }
             if merged[groupKey] == nil {
-                var seed = word
+                var seed = word // a raw row: one id, its own status
                 seed.text = word.text.lowercased()
-                seed.databaseIds = word.allDatabaseIds
-                seed.databaseStatuses = word.databaseStatuses.isEmpty ? [word.databaseId: word.status] : word.databaseStatuses
-                seed.status = mergedStatus(from: Array(seed.databaseStatuses.values))
                 seed.usage = preferred(seed.databaseId) ?? word.usage
                 merged[groupKey] = seed
                 order.append(groupKey)
@@ -478,12 +473,11 @@ class DatabaseManager: ObservableObject {
             }
 
             var current = merged[groupKey]!
-            for id in word.allDatabaseIds where !current.databaseIds.contains(id) {
+            for id in word.databaseIds where !current.databaseIds.contains(id) {
                 current.databaseIds.append(id)
             }
 
-            let incomingStatuses = word.databaseStatuses.isEmpty ? [word.databaseId: word.status] : word.databaseStatuses
-            for (id, status) in incomingStatuses {
+            for (id, status) in word.databaseStatuses {
                 current.databaseStatuses[id] = status
             }
 
@@ -768,7 +762,7 @@ class DatabaseManager: ObservableObject {
         dbQueue.async {
             guard let db = self.db else { return }
             do {
-                let targetIds = word.allDatabaseIds
+                let targetIds = word.databaseIds
                 let placeholders = Array(repeating: "?", count: targetIds.count).joined(separator: ", ")
                 // Match the book by title + authors so duplicate BOOK_INFO rows of one book are included.
                 let sql = """
@@ -855,7 +849,7 @@ class DatabaseManager: ObservableObject {
         var oldStatuses: [String: WordStatus] = [:]
         var newStatuses: [String: WordStatus] = [:]
         for (word, status) in changes {
-            for id in word.allDatabaseIds {
+            for id in word.databaseIds {
                 // The same WORDS.id can sit in several rows (one per book); keep its first old status.
                 oldStatuses[id] = oldStatuses[id] ?? word.databaseStatuses[id] ?? word.status
                 newStatuses[id] = status
@@ -886,7 +880,7 @@ class DatabaseManager: ObservableObject {
                     // Update every row sharing a changed WORDS.id: status is shared across books.
                     var updated = self.words
                     for i in updated.indices {
-                        let matchedIds = updated[i].allDatabaseIds.filter { statuses[$0] != nil }
+                        let matchedIds = updated[i].databaseIds.filter { statuses[$0] != nil }
                         guard !matchedIds.isEmpty else { continue }
                         for id in matchedIds {
                             updated[i].databaseStatuses[id] = statuses[id]
@@ -910,10 +904,14 @@ class DatabaseManager: ObservableObject {
     // MARK: - Preferred Usage Persistence
     
     func savePreferredUsage(for word: Word, usage: String) {
-        saveSetting(key: "pref_usage_\(Self.preferredUsageKey(wordId: word.databaseId, bookKey: word.bookKey))", value: usage)
-        
+        // Under every form of the row: on load the first form with a saved choice wins, and the
+        // row's forms change order as new lookups arrive, so a choice saved under one form could lose.
+        for id in word.databaseIds {
+            saveSetting(key: "pref_usage_\(Self.preferredUsageKey(wordId: id, bookKey: word.bookKey))", value: usage)
+        }
+
         // Update local memory immediately: same word, same book only
-        for i in words.indices where words[i].bookKey == word.bookKey && words[i].allDatabaseIds.contains(word.databaseId) {
+        for i in words.indices where words[i].bookKey == word.bookKey && words[i].databaseIds.contains(word.databaseId) {
             words[i].usage = usage
         }
     }

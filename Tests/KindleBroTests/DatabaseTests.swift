@@ -90,7 +90,7 @@ private func makeLibrary() throws -> URL {
     try await waitUntil { !manager.words.isEmpty }
     #expect(Set(manager.words.map(\.text)) == ["peeve", "glib"])
     let peeve = try #require(manager.words.first { $0.text == "peeve" })
-    #expect(Set(peeve.allDatabaseIds) == ["en:peeve", "en:peeved"])
+    #expect(Set(peeve.databaseIds) == ["en:peeve", "en:peeved"])
     #expect(peeve.usage == "sentence A2") // newest form's sentence; book B's chosen sentence must not leak in
     #expect(peeve.relatedBookCount == 1) // book B; the duplicate row of A is not another book
     #expect(manager.words.first { $0.text == "glib" }?.relatedBookCount == 0)
@@ -102,7 +102,7 @@ private func makeLibrary() throws -> URL {
     manager.fetchWords(for: nil, search: "peeved")
     try await waitUntil { !manager.words.isEmpty }
     #expect(manager.words.contains { $0.text == "peeve" && $0.bookTitle == "B" })
-    #expect(manager.words.contains { $0.text == "peeve" && $0.bookTitle == "A" && $0.allDatabaseIds.count == 2 })
+    #expect(manager.words.contains { $0.text == "peeve" && $0.bookTitle == "A" && $0.databaseIds.count == 2 })
     #expect(!manager.words.contains { $0.text == "glib" })
 }
 
@@ -177,7 +177,7 @@ private func category(_ url: URL, _ id: String) throws -> Int64? {
     let heathenRows = manager.words.filter { $0.text == "heathen" }
     #expect(heathenRows.count == 1)
     let heathen = try #require(heathenRows.first)
-    #expect(Set(heathen.allDatabaseIds) == ["en:Heathen", "en:heathen"])
+    #expect(Set(heathen.databaseIds) == ["en:Heathen", "en:heathen"])
     #expect(manager.books.first { $0.title == "A" }?.wordCount == 3)
 
     manager.updateStatus(words: [heathen], newStatus: .mastered)
@@ -224,19 +224,45 @@ private func category(_ url: URL, _ id: String) throws -> Int64? {
     #expect(rows.count == 1)
     let vitiate = try #require(rows.first)
     #expect(vitiate.text == "vitiate") // two forms: shown as the dictionary form
-    #expect(Set(vitiate.allDatabaseIds) == ["en:vitiated", "en:vitiates"])
+    #expect(Set(vitiate.databaseIds) == ["en:vitiated", "en:vitiates"])
     #expect(vitiate.relatedBookCount == 1) // book B has "vitiated"
 }
 
-@MainActor @Test func russianSearchFindsOtherFormsByLemma() async throws {
+@MainActor @Test func sentenceChoiceSticksForRowWithSeveralForms() async throws {
+    let url = try makeLibrary()
+    // "vitiates" kept its own choice from before forms were grouped; it loads first (newest lookup).
+    try Connection(url.path).execute("""
+    INSERT INTO WORDS VALUES ('en:vitiate','vitiate','vitiate','en',0), ('en:vitiates','vitiates','vitiate','en',0);
+    INSERT INTO LOOKUPS VALUES ('12','en:vitiate','b1','v one',12), ('13','en:vitiates','b1','s zero',10),
+                               ('14','en:vitiates','b1','s one',14);
+    INSERT INTO settings VALUES ('pref_usage_en:vitiates|A_X','s zero');
+    """)
+    let manager = DatabaseManager(storeURL: url)
+    manager.fetchWords(for: "b1")
+    try await waitUntil { manager.words.contains { $0.lemma == "vitiate" } }
+    let row = try #require(manager.words.first { $0.lemma == "vitiate" })
+    manager.savePreferredUsage(for: row, usage: "v one")
+
+    manager.words = []
+    manager.fetchWords(for: "b1") // queued behind the save
+    try await waitUntil { !manager.words.isEmpty }
+    #expect(manager.words.first { $0.lemma == "vitiate" }?.usage == "v one")
+}
+
+@MainActor @Test func searchFindsOtherFormsByLemma() async throws {
     UserDefaults.standard.register(defaults: ["enableRelatedWords": true, "enableStemSearch": true])
     let url = try makeLibrary()
     try Connection(url.path).execute("""
-    INSERT INTO WORDS VALUES ('ru:слободе','слободе','слобода','ru',0);
-    INSERT INTO LOOKUPS VALUES ('10','ru:слободе','b1','Жили в слободе тихо.',10);
+    INSERT INTO WORDS VALUES ('ru:слободе','слободе','слобода','ru',0), ('en:sought','sought','sought','en',0);
+    INSERT INTO LOOKUPS VALUES ('10','ru:слободе','b1','Жили в слободе тихо.',10),
+                               ('11','en:sought','b1','He sought refuge in the hills.',11);
     """)
     let manager = DatabaseManager(storeURL: url)
-    manager.fetchWords(for: nil, search: "слободы") // a form not in the library
-    try await waitUntil { !manager.words.isEmpty }
-    #expect(manager.words.map(\.lemma) == ["слобода"])
+    // A form not in the library, the dictionary form itself, and the dictionary form of an irregular word
+    for (search, lemma) in [("слободы", "слобода"), ("слобода", "слобода"), ("seek", "seek")] {
+        manager.words = []
+        manager.fetchWords(for: nil, search: search)
+        try await waitUntil { !manager.words.isEmpty }
+        #expect(manager.words.map(\.lemma) == [lemma], "search \(search)")
+    }
 }

@@ -181,24 +181,17 @@ struct WordRow: View {
             
             if let primaryUsageText = word.usage {
                 VStack(alignment: .leading, spacing: 6) {
-                    // Filter allUsages to find the primary usage object
-                    let primaryUsage = word.allUsages.first(where: { $0.text == primaryUsageText })
-                    
                     if isExpanded {
                         // In expanded mode, show ALL usages sorted by date
                         ForEach(word.sortedUsages) { usageObj in
                             usageRow(usageObj, isSelected: usageObj.text == primaryUsageText, showStar: true)
                         }
-                    } else if let primary = primaryUsage {
-                        // In collapsed mode, show the preferred one from the list if available
-                        usageRow(primary, isSelected: true, showStar: false)
                     } else {
-                        // Fallback: Show the primary text directly if allUsages is empty/fetching
-                        Text(primaryUsageText)
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .italic()
-                            .lineLimit(2)
+                        // A refresh loads only the newest sentence, so an older chosen one is built here.
+                        // Its timestamp is a stand-in; collapsed rows don't show the date.
+                        usageRow(word.allUsages.first { $0.text == primaryUsageText }
+                                     ?? WordUsage(text: primaryUsageText, timestamp: word.timestamp),
+                                 isSelected: true, showStar: false)
                     }
                 }
             }

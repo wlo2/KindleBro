@@ -167,7 +167,7 @@ struct ContentView: View {
             hideList: hideListForJump,
             enableRelatedWords: enableRelatedWords,
             onImport: { dbManager.showImportPicker = true },
-            onStatusUpdate: { dbManager.updateStatus(word: $0, newStatus: $1, bulkIds: selectedWordIds) },
+            onStatusUpdate: { ids, status in dbManager.updateStatus(words: dbManager.words.filter { ids.contains($0.id) }, newStatus: status) },
             onToast: { showToast(message: $0, duration: $1) },
             onBulkCopy: handleBulkCopy,
             onJumpToWord: handleJumpToWord,
@@ -308,8 +308,8 @@ struct ContentView: View {
         } else { showToast(message: "No device found", duration: 4.0) }
     }
     
-    private func handleBulkCopy() {
-        let t = dbManager.formatSelected(ids: selectedWordIds)
+    private func handleBulkCopy(_ ids: Set<Word.ID>) {
+        let t = dbManager.formatSelected(ids: ids)
         if !t.isEmpty { NSPasteboard.general.clearContents(); NSPasteboard.general.setString(t, forType: .string); showToast(message: "Copied", duration: 2.5) }
     }
     
@@ -407,13 +407,18 @@ struct WordListView: View {
     @Binding var scrollRequest: UUID?
     @Binding var lastScrolledId: String?
     
-    let onStatusUpdate: (Word, WordStatus) -> Void
+    let onStatusUpdate: (Set<Word.ID>, WordStatus) -> Void
     let onToast: (String, TimeInterval) -> Void
-    let onBulkCopy: () -> Void
+    let onBulkCopy: (Set<Word.ID>) -> Void
     let onJumpToWord: (Word) -> Void
     let enableRelatedWords: Bool
     let onSelectAll: () -> Void
     let onCopyAll: () -> Void
+    
+    // Right-click acts on the whole selection when the clicked word is in it, else on that word alone.
+    private func menuIds(for word: Word) -> Set<Word.ID> {
+        selectedWordIds.contains(word.id) ? selectedWordIds : [word.id]
+    }
     
     var body: some View {
         ScrollViewReader { proxy in
@@ -421,9 +426,9 @@ struct WordListView: View {
                 ForEach(dbManager.words) { word in
                     WordRow(
                         word: word,
-                        onUpdateStatus: { onStatusUpdate(word, $0) },
+                        onUpdateStatus: { onStatusUpdate(menuIds(for: word), $0) },
                         onCopy: { onToast("Copied", 2.5) },
-                        onContextCopy: onBulkCopy,
+                        onContextCopy: { onBulkCopy(menuIds(for: word)) },
                         onSelectUsage: { dbManager.savePreferredUsage(for: word, usage: $0) },
                         onSelectAll: onSelectAll,
                         onCopyAll: onCopyAll,
@@ -456,9 +461,9 @@ struct DetailViewContent: View {
     let enableRelatedWords: Bool
     
     let onImport: () -> Void
-    let onStatusUpdate: (Word, WordStatus) -> Void
+    let onStatusUpdate: (Set<Word.ID>, WordStatus) -> Void
     let onToast: (String, TimeInterval) -> Void
-    let onBulkCopy: () -> Void
+    let onBulkCopy: (Set<Word.ID>) -> Void
     let onJumpToWord: (Word) -> Void
     let onSelectBatch: () -> Void
     let onSelectAll: () -> Void
@@ -577,8 +582,4 @@ extension DatabaseManager {
     func learningWordIds(limit: Int) -> [Word.ID] { learningWords(limit: limit).map(\.id) }
     func masterAllLearning() { updateStatus(words: learningWords(), newStatus: .mastered) }
     func masterSelected(ids: Set<Word.ID>) { updateStatus(words: words.filter { ids.contains($0.id) && $0.status != .mastered }, newStatus: .mastered) }
-    func updateStatus(word: Word, newStatus: WordStatus, bulkIds: Set<Word.ID>) {
-        if bulkIds.contains(word.id) { updateStatus(words: words.filter { bulkIds.contains($0.id) }, newStatus: newStatus) }
-        else { updateStatus(words: [word], newStatus: newStatus) }
-    }
 }
