@@ -266,3 +266,48 @@ private func category(_ url: URL, _ id: String) throws -> Int64? {
         #expect(manager.words.map(\.lemma) == [lemma], "search \(search)")
     }
 }
+
+@MainActor @Test func syncedBooksAreDatedBySyncAndKnownBooksKeepTheirDate() async throws {
+    let url = try makeLibrary() // books A (rows b1, b1dup) and B, first looked up at 1 and 2
+    let source = url.deletingLastPathComponent().appendingPathComponent("vocab.db")
+    try Connection(source.path).execute("""
+    CREATE TABLE WORDS (id TEXT PRIMARY KEY, word TEXT, stem TEXT, lang TEXT, category INTEGER DEFAULT 0);
+    CREATE TABLE BOOK_INFO (id TEXT PRIMARY KEY, title TEXT, authors TEXT, lang TEXT);
+    CREATE TABLE LOOKUPS (id TEXT PRIMARY KEY, word_key TEXT, book_key TEXT, usage TEXT, timestamp INTEGER);
+    INSERT INTO BOOK_INFO VALUES ('b3','C','Z','en'), ('b1other','A','X','en');
+    INSERT INTO WORDS VALUES ('en:glib','glib','glib','en',0);
+    INSERT INTO LOOKUPS VALUES ('20','en:glib','b3','glib in C',20), ('21','en:glib','b1other','glib on another Kindle',21);
+    """)
+    let manager = DatabaseManager(storeURL: url)
+    try await waitUntil { manager.books.count == 2 }
+    #expect(manager.books.map(\.dateAdded) == [1, 2]) // A, B: no recorded sync, so their first lookup
+
+    let syncStart = Int64(Date().timeIntervalSince1970 * 1000)
+    let result = await withCheckedContinuation { done in
+        manager.importDatabase(from: source) { done.resume(returning: $0) }
+    }
+    if case .failure(let error) = result { Issue.record("sync failed: \(error)") }
+    try await waitUntil { manager.books.count == 3 }
+    let dates = Dictionary(uniqueKeysWithValues: manager.books.map { ($0.title, $0.dateAdded) })
+    #expect((dates["C"] ?? 0) >= syncStart) // new book: dated by this sync
+    #expect(dates["A"] == 1) // another Kindle's copy of A doesn't make it new
+    #expect(dates["B"] == 2)
+}
+
+@Test func fictionRanksPutCommonWordsFirstAndShareOneRankAcrossForms() throws {
+    let url = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        .appendingPathComponent("../../Resources/english_ranks.txt")
+    let ranks = FrequencyRanks.parse(try String(contentsOf: url, encoding: .utf8))
+    #expect(ranks["the"] == 1)
+    #expect(ranks["glanced"] != nil && ranks["glanced"] == ranks["glance"])
+    #expect(try #require(ranks["glance"]) < #require(ranks["vitiate"]))
+}
+
+@Test func copiedWordsCarryTheirRankUnlessTurnedOff() {
+    var word = Word(id: "remit", databaseId: "en:remit", text: "remit", lemma: "remit", status: .learning,
+                    usage: "It is beyond our remit.", bookId: nil, bookTitle: nil, bookAuthors: nil, timestamp: 0)
+    #expect(word.clipboardText(withRank: true) == "remit\nIt is beyond our remit.")
+    word.rank = 18950
+    #expect(word.clipboardText(withRank: true) == "remit (Rank 18950)\nIt is beyond our remit.")
+    #expect(word.clipboardText(withRank: false) == "remit\nIt is beyond our remit.")
+}

@@ -1,5 +1,12 @@
 import Foundation
 
+// An error whose message is shown to the user as it is.
+struct UserFacingError: LocalizedError {
+    let message: String
+    init(_ message: String) { self.message = message }
+    var errorDescription: String? { message }
+}
+
 struct Book: Identifiable, Hashable {
     let id: String // BOOK_INFO.id
     let title: String
@@ -7,6 +14,7 @@ struct Book: Identifiable, Hashable {
     var wordCount: Int = 0
     var learningWordCount: Int = 0
     var isMastered: Bool = false
+    var dateAdded: Int64 = 0 // ms, like lookup timestamps: the sync that brought the book in
 
     var sidebarCountText: String {
         if !isMastered && learningWordCount < wordCount {
@@ -14,6 +22,11 @@ struct Book: Identifiable, Hashable {
         }
         return "\(wordCount)"
     }
+}
+
+// Sidebar book order; stored in UserDefaults as "bookSort"
+enum BookSort: String {
+    case dateAdded, alphabetical
 }
 
 struct WordUsage: Identifiable, Hashable {
@@ -42,11 +55,19 @@ struct Word: Identifiable, Hashable {
     let bookAuthors: String? // From BOOK_INFO
     var timestamp: Int64 // Primary timestamp (often the latest)
     var relatedBookCount: Int = 0 // Count of other books sharing the same stem
+    var rank: Int? = nil // frequency rank of the dictionary form in English fiction; nil if not English or rare
     
     var date: Date {
         return Date(timeIntervalSince1970: TimeInterval(timestamp / 1000))
     }
     
+    // Copy, Copy with prompt, Copy all and Generate flashcards: "remit (Rank 18950)" over the usage,
+    // so a prompt can put the rank on the card. Settings can leave the rank out.
+    func clipboardText(withRank: Bool) -> String {
+        let rankText = withRank ? rank.map { " (Rank \($0))" } : nil
+        return "\(text)\(rankText ?? "")\n\(usage ?? "")"
+    }
+
     // Duplicate BOOK_INFO rows of one book share this key
     var bookKey: String { "\(bookTitle ?? "")_\(bookAuthors ?? "")" }
 

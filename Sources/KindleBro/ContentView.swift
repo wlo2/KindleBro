@@ -26,6 +26,19 @@ struct ContentView: View {
     @AppStorage("enableRelatedWords") private var enableRelatedWords = true
     @AppStorage("enableStemSearch") private var enableStemSearch = true
     @AppStorage("learningBatchSize") private var learningBatchSize = 15
+    @AppStorage("autoSyncOnLaunch") private var autoSyncOnLaunch = true
+    @AppStorage("bookSort") private var bookSort = BookSort.dateAdded
+    @AppStorage("claudeCLIPath") private var claudeCLIPath = "" // empty: Claude Code not connected
+    @AppStorage("claudeModel") private var claudeModel = ""
+    @AppStorage("notePath") private var notePath = "" // the note Append adds flashcards to
+    @State private var showNoteAppend = false
+    
+    // Generated flashcards; in memory only, so quitting discards them.
+    @State private var flashcardPanel: FlashcardPanel?
+    @State private var flashcardTask: Task<Void, Never>?
+    
+    private static let kindleVocabPath = "/Volumes/Kindle/system/vocabulary/vocab.db"
+    private static var didLaunchSync = false // onAppear runs again when the main window is reopened
     
     // Session Restoration
     @AppStorage("lastSelectedBookId") private var lastSelectedBookId: String = ""
@@ -49,6 +62,14 @@ struct ContentView: View {
         }
         .fileImporter(isPresented: $dbManager.showImportPicker, allowedContentTypes: [.data]) { handleImport($0) }
         .fileExporter(isPresented: $dbManager.showExportPicker, document: SQLiteFile(), contentType: .data, defaultFilename: "vocab.db") { handleExport($0) }
+        .sheet(isPresented: $showNoteAppend) {
+            let kept = flashcardPanel?.kept ?? []
+            NoteAppendSheet(cards: kept.map { ($0.word.bookTitle ?? "", $0.card) }, path: notePath) {
+                let name = URL(fileURLWithPath: notePath).lastPathComponent
+                showToast(message: "Added \(kept.count) \(kept.count == 1 ? "flashcard" : "flashcards") to \(name)", duration: 2.5)
+                markCopiedFlashcards(kept.map(\.word))
+            }
+        }
         .alert("Clear Database?", isPresented: $dbManager.showClearConfirmation) {
             Button("Clear", role: .destructive) { dbManager.clearDatabase() }
             Button("Cancel", role: .cancel) { }
@@ -70,6 +91,7 @@ struct ContentView: View {
         }
         .onChange(of: dbManager.words) { _, newValue in
             handleDataLoaded(newValue)
+            flashcardPanel?.update(from: newValue)
         }
         // Both settings change what the word query returns
         .onChange(of: enableRelatedWords) { _, _ in refreshWords() }
@@ -79,42 +101,39 @@ struct ContentView: View {
     @ViewBuilder
     private var sidebarView: some View {
         List(selection: $selectedBookId) {
-            if enableCompletedBooks {
-                let filtered = bookSearchText.isEmpty
-                    ? dbManager.books
-                    : dbManager.books.filter { $0.title.localizedCaseInsensitiveContains(bookSearchText) }
-                let activeBooks = filtered.filter { !$0.isMastered }
-                let completedBooks = filtered.filter { $0.isMastered }
+            // dbManager.books is alphabetical; the sort is stable, so books added together stay alphabetical.
+            let sorted = bookSort == .dateAdded ? dbManager.books.sorted { $0.dateAdded > $1.dateAdded } : dbManager.books
+            let filtered = bookSearchText.isEmpty
+                ? sorted
+                : sorted.filter { $0.title.localizedCaseInsensitiveContains(bookSearchText) }
+            // With Completed books off, every book stays in the Books section.
+            let activeBooks = enableCompletedBooks ? filtered.filter { !$0.isMastered } : filtered
+            let completedBooks = enableCompletedBooks ? filtered.filter { $0.isMastered } : []
 
-                if !activeBooks.isEmpty {
-                    Section {
-                        if !booksCollapsed || !bookSearchText.isEmpty {
-                            ForEach(activeBooks) { book in
-                                NavigationLink(value: book.id) { BookRow(book: book) }
-                            }
+            if !activeBooks.isEmpty {
+                Section {
+                    if !booksCollapsed || !bookSearchText.isEmpty {
+                        ForEach(activeBooks) { book in
+                            NavigationLink(value: book.id) { BookRow(book: book) }
                         }
-                    } header: {
-                        sectionHeader("Books", icon: "books.vertical", count: activeBooks.count, collapsed: $booksCollapsed)
                     }
-                    .collapsible(false) // we draw our own chevron; the system one shifted the header on hover
+                } header: {
+                    sectionHeader("Books", icon: "books.vertical", count: activeBooks.count, collapsed: $booksCollapsed)
                 }
+                .collapsible(false) // we draw our own chevron; the system one shifted the header on hover
+            }
 
-                if !completedBooks.isEmpty {
-                    Section {
-                        if !completedCollapsed || !bookSearchText.isEmpty {
-                            ForEach(completedBooks) { book in
-                                NavigationLink(value: book.id) { BookRow(book: book, showStrikethrough: false) }
-                            }
+            if !completedBooks.isEmpty {
+                Section {
+                    if !completedCollapsed || !bookSearchText.isEmpty {
+                        ForEach(completedBooks) { book in
+                            NavigationLink(value: book.id) { BookRow(book: book, showStrikethrough: false) }
                         }
-                    } header: {
-                        sectionHeader("Completed", icon: "checkmark.circle", count: completedBooks.count, collapsed: $completedCollapsed)
                     }
-                    .collapsible(false) // we draw our own chevron; the system one shifted the header on hover
+                } header: {
+                    sectionHeader("Completed", icon: "checkmark.circle", count: completedBooks.count, collapsed: $completedCollapsed)
                 }
-            } else {
-                ForEach(bookSearchText.isEmpty ? dbManager.books : dbManager.books.filter { $0.title.localizedCaseInsensitiveContains(bookSearchText) }) { book in
-                    NavigationLink(value: book.id) { BookRow(book: book) }
-                }
+                .collapsible(false) // we draw our own chevron; the system one shifted the header on hover
             }
         }
         .searchable(text: $bookSearchText, placement: .sidebar, prompt: "Search Books")
@@ -126,28 +145,53 @@ struct ContentView: View {
         }
     }
     
+    // In both section headers; both menus change the one shared sort.
+    private var bookSortMenu: some View {
+        Menu {
+            Picker("Sort Books By", selection: $bookSort) {
+                Text("Date Added").tag(BookSort.dateAdded)
+                Text("Alphabetical").tag(BookSort.alphabetical)
+            }
+            .pickerStyle(.inline)
+        } label: {
+            Image(systemName: "arrow.up.arrow.down")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Sort books")
+    }
+    
     private func sectionHeader(_ title: String, icon: String, count: Int, collapsed: Binding<Bool>) -> some View {
         HStack(spacing: 8) {
             Label(title, systemImage: icon)
             Spacer()
-            Text("\(count)")
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .frame(minWidth: 18, alignment: .trailing)
-            Button(action: { collapsed.wrappedValue.toggle() }) {
-                Image(systemName: collapsed.wrappedValue ? "chevron.right" : "chevron.down")
+            HStack(spacing: 6) { // the count sits at equal distance from the sort and collapse icons
+                bookSortMenu
+                Text("\(count)")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                    .frame(width: sidebarTrailingColumnWidth, alignment: .trailing)
-                    .padding(.trailing, sidebarTrailingColumnPadding)
-                    .padding(.vertical, 2)
-                    .contentShape(Rectangle())
+                Button(action: { collapsed.wrappedValue.toggle() }) {
+                    Image(systemName: collapsed.wrappedValue ? "chevron.right" : "chevron.down")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        // Same width for both chevrons, so the count doesn't move on toggle;
+                        // leading, so the gap after the count is just the stack spacing.
+                        .frame(width: 12, alignment: .leading)
+                        .padding(.trailing, sidebarTrailingColumnPadding)
+                        .padding(.vertical, 2)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!bookSearchText.isEmpty)
+                .help(bookSearchText.isEmpty
+                      ? "\(collapsed.wrappedValue ? "Show" : "Hide") \(title.lowercased())"
+                      : "Search is active")
             }
-            .buttonStyle(.plain)
-            .disabled(!bookSearchText.isEmpty)
-            .help(bookSearchText.isEmpty
-                  ? "\(collapsed.wrappedValue ? "Show" : "Hide") \(title.lowercased())"
-                  : "Search is active")
         }
         .font(.title3)
         .padding(.vertical, 10)
@@ -177,7 +221,14 @@ struct ContentView: View {
             onUndo: { dbManager.undoLastAction() },
             onRefresh: refreshWords,
             onPromptCopy: handlePromptCopy,
-            onArrowKeyUpdate: handleArrowKeyStatusUpdate
+            onArrowKeyUpdate: handleArrowKeyStatusUpdate,
+            isClaudeConnected: !claudeCLIPath.isEmpty,
+            flashcardPanel: flashcardPanel,
+            onGenerateBatch: handleGenerateBatch,
+            onGenerateSelected: { generateFlashcards(for: dbManager.words.filter { selectedWordIds.contains($0.id) }) },
+            onAppendFlashcards: handleAppendFlashcards,
+            onCopyFlashcards: handleCopyFlashcards,
+            onCloseFlashcards: closeFlashcards
         )
     }
     
@@ -212,8 +263,24 @@ struct ContentView: View {
         }
         if dbManager.isDatabaseLoaded {
             restoreLastSelectedBook()
-            if let p = dbManager.getSetting(key: "customPrompt") { customPrompt = p }
+            syncPromptWithLibrary()
             refreshWords()
+        }
+        // Sync on launch only when the Kindle is already connected: no "No device found" toast.
+        if !Self.didLaunchSync {
+            Self.didLaunchSync = true
+            if autoSyncOnLaunch, FileManager.default.fileExists(atPath: Self.kindleVocabPath) { syncKindle() }
+        }
+    }
+
+    // The library keeps a copy of the prompt, so it travels with exports and backups; that copy wins.
+    // A library without one (new, or the prompt was saved while none was loaded) gets the current prompt.
+    // The default prompt isn't stored, so a library that never had a custom one follows the app's default.
+    private func syncPromptWithLibrary() {
+        if let p = dbManager.getSetting(key: "customPrompt") {
+            customPrompt = p
+        } else if customPrompt != defaultPrompt {
+            dbManager.saveSetting(key: "customPrompt", value: customPrompt)
         }
     }
 
@@ -232,7 +299,7 @@ struct ContentView: View {
         dbManager.importDatabase(from: url) { r in
             guard case .success(let c) = r else { return }
             showToast(message: "\(toast). \(c) words added", duration: 4.0)
-            if let p = dbManager.getSetting(key: "customPrompt") { customPrompt = p }
+            syncPromptWithLibrary()
             refreshWords() // new words for the open book
         }
     }
@@ -302,9 +369,8 @@ struct ContentView: View {
     private func refreshWords() { dbManager.fetchWords(for: searchText.isEmpty ? selectedBookId : nil, search: searchText) }
     
     private func syncKindle() {
-        let p = "/Volumes/Kindle/system/vocabulary/vocab.db"
-        if FileManager.default.fileExists(atPath: p) {
-            importLibrary(from: URL(fileURLWithPath: p), toast: "Synced")
+        if FileManager.default.fileExists(atPath: Self.kindleVocabPath) {
+            importLibrary(from: URL(fileURLWithPath: Self.kindleVocabPath), toast: "Synced")
         } else { showToast(message: "No device found", duration: 4.0) }
     }
     
@@ -345,6 +411,60 @@ struct ContentView: View {
         }
     }
     
+    private func handleGenerateBatch() {
+        let ids = Set(dbManager.learningWordIds(limit: max(1, learningBatchSize)))
+        generateFlashcards(for: dbManager.words.filter { ids.contains($0.id) })
+    }
+
+    // Runs the prompt through Claude Code; the cards appear beside their words.
+    private func generateFlashcards(for words: [Word]) {
+        guard !words.isEmpty else { showToast(message: "No words to generate flashcards for", duration: 2.5); return }
+        flashcardTask?.cancel()
+        flashcardPanel = FlashcardPanel(words: words)
+        flashcardPanel?.update(from: dbManager.words)
+        let prompt = customPrompt, cliPath = claudeCLIPath, model = claudeModel
+        flashcardTask = Task {
+            do {
+                let cards = try await ClaudeCLI.generate(prompt: prompt, words: words, withRank: DatabaseManager.copiesRank,
+                                                         model: model, cliPath: cliPath)
+                guard !Task.isCancelled else { return }
+                flashcardPanel?.cards = cards
+            } catch {
+                guard !Task.isCancelled else { return } // closed, or replaced by a newer generation
+                flashcardPanel?.error = error.localizedDescription
+            }
+            flashcardPanel?.isGenerating = false
+            flashcardTask = nil
+        }
+    }
+
+    // Copying or adding the cards counts as making them, like Copy with prompt.
+    private func markCopiedFlashcards(_ words: [Word]) {
+        if autoMasterOnCopy { dbManager.updateStatus(words: words.filter { $0.status != .mastered }, newStatus: .mastered) }
+    }
+
+    private func handleCopyFlashcards() {
+        let kept = flashcardPanel?.kept ?? []
+        guard !kept.isEmpty else { showToast(message: "No flashcards to copy", duration: 2.5); return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(kept.map(\.card).joined(separator: "\n\n"), forType: .string)
+        showToast(message: "Copied \(kept.count) \(kept.count == 1 ? "flashcard" : "flashcards")", duration: 2.5)
+        markCopiedFlashcards(kept.map(\.word))
+    }
+
+    // The first time, asks for the note; then shows the note with the cards in place before writing.
+    private func handleAppendFlashcards() {
+        guard flashcardPanel?.kept.isEmpty == false else { showToast(message: "No flashcards to add", duration: 2.5); return }
+        if notePath.isEmpty, NoteList.choose() == nil { return }
+        showNoteAppend = true
+    }
+
+    private func closeFlashcards() {
+        flashcardTask?.cancel() // stops a generation still running
+        flashcardTask = nil
+        flashcardPanel = nil
+    }
+
     private func handleJumpToWord(_ word: Word) {
         if dbManager.words.contains(where: { $0.id == word.id }) {
             selectedWordIds = [word.id]
@@ -414,6 +534,7 @@ struct WordListView: View {
     let enableRelatedWords: Bool
     let onSelectAll: () -> Void
     let onCopyAll: () -> Void
+    let flashcardPanel: FlashcardPanel?
     
     // Right-click acts on the whole selection when the clicked word is in it, else on that word alone.
     private func menuIds(for word: Word) -> Set<Word.ID> {
@@ -424,19 +545,31 @@ struct WordListView: View {
         ScrollViewReader { proxy in
             List(selection: $selectedWordIds) {
                 ForEach(dbManager.words) { word in
-                    WordRow(
-                        word: word,
-                        onUpdateStatus: { onStatusUpdate(menuIds(for: word), $0) },
-                        onCopy: { onToast("Copied", 2.5) },
-                        onContextCopy: { onBulkCopy(menuIds(for: word)) },
-                        onSelectUsage: { dbManager.savePreferredUsage(for: word, usage: $0) },
-                        onSelectAll: onSelectAll,
-                        onCopyAll: onCopyAll,
-                        onJumpToWord: onJumpToWord,
-                        enableRelatedWords: enableRelatedWords,
-                        showBookTitle: !searchText.isEmpty,
-                        dbManager: dbManager
-                    ).tag(word.id).id(word.id)
+                    HStack(alignment: .top, spacing: 12) {
+                        WordRow(
+                            word: word,
+                            onUpdateStatus: { onStatusUpdate(menuIds(for: word), $0) },
+                            onCopy: { onToast("Copied", 2.5) },
+                            onContextCopy: { onBulkCopy(menuIds(for: word)) },
+                            onSelectUsage: { dbManager.savePreferredUsage(for: word, usage: $0) },
+                            onSelectAll: onSelectAll,
+                            onCopyAll: onCopyAll,
+                            onJumpToWord: onJumpToWord,
+                            enableRelatedWords: enableRelatedWords,
+                            showBookTitle: !searchText.isEmpty,
+                            dbManager: dbManager,
+                            // This word alone, even when it is part of the selection
+                            onToggleIgnore: flashcardPanel.flatMap { panel in panel.cards[word.id] == nil ? nil : {
+                                onStatusUpdate([word.id], word.status == .ignored ? panel.statusAfterUnignore(of: word.id) : .ignored)
+                            } }
+                        )
+                        // The flashcard column: each card on the same line as its word
+                        if let flashcardPanel {
+                            Divider()
+                            FlashcardCell(word: word, panel: flashcardPanel)
+                        }
+                    }
+                    .tag(word.id).id(word.id)
                 }
             }
             .onChange(of: scrollRequest) { _, newValue in
@@ -472,6 +605,15 @@ struct DetailViewContent: View {
     let onRefresh: () -> Void
     let onPromptCopy: () -> Void
     let onArrowKeyUpdate: (WordStatus) -> Void
+    let isClaudeConnected: Bool
+    let flashcardPanel: FlashcardPanel?
+    let onGenerateBatch: () -> Void
+    let onGenerateSelected: () -> Void
+    let onAppendFlashcards: () -> Void
+    let onCopyFlashcards: () -> Void
+    let onCloseFlashcards: () -> Void
+
+    private var isGenerating: Bool { flashcardPanel?.isGenerating == true }
 
     var body: some View {
         ZStack {
@@ -479,20 +621,28 @@ struct DetailViewContent: View {
                 ContentUnavailableView("Library Empty", systemImage: "books.vertical", description: Text("Import a vocab.db file to get started."))
                     .toolbar { Button("Import", action: onImport) }
             } else {
-                WordListView(
-                    dbManager: dbManager,
-                    selectedWordIds: $selectedWordIds,
-                    searchText: searchText,
-                    scrollRequest: $scrollRequest,
-                    lastScrolledId: $lastScrolledId,
-                    onStatusUpdate: onStatusUpdate,
-                    onToast: onToast,
-                    onBulkCopy: onBulkCopy,
-                    onJumpToWord: onJumpToWord,
-                    enableRelatedWords: enableRelatedWords,
-                    onSelectAll: onSelectAll,
-                    onCopyAll: onCopyAll
-                )
+                VStack(spacing: 0) {
+                    if let flashcardPanel {
+                        FlashcardPanelHeader(panel: flashcardPanel, onAppend: onAppendFlashcards,
+                                             onCopy: onCopyFlashcards, onClose: onCloseFlashcards)
+                        Divider()
+                    }
+                    WordListView(
+                        dbManager: dbManager,
+                        selectedWordIds: $selectedWordIds,
+                        searchText: searchText,
+                        scrollRequest: $scrollRequest,
+                        lastScrolledId: $lastScrolledId,
+                        onStatusUpdate: onStatusUpdate,
+                        onToast: onToast,
+                        onBulkCopy: onBulkCopy,
+                        onJumpToWord: onJumpToWord,
+                        enableRelatedWords: enableRelatedWords,
+                        onSelectAll: onSelectAll,
+                        onCopyAll: onCopyAll,
+                        flashcardPanel: flashcardPanel
+                    )
+                }
                 .opacity(hideList ? 0 : 1)
                 .navigationTitle(!searchText.isEmpty ? "Results" : (selectedBook?.title ?? "All Words"))
                 .searchable(text: $searchText, prompt: "Search words or usage...")
@@ -506,6 +656,10 @@ struct DetailViewContent: View {
                     } else {
                         ToolbarItemGroup(placement: .status) {
                             Button(action: onSelectBatch) { Label("Select learning batch", systemImage: "checkmark.circle") }.help("Select learning batch")
+                            if isClaudeConnected {
+                                Button(action: onGenerateBatch) { Label("Generate flashcards for a learning batch", systemImage: "sparkles.rectangle.stack") }
+                                    .help("Generate flashcards for a learning batch").disabled(isGenerating)
+                            }
                             Button(action: onSelectAll) { Label("Select all Learning words", systemImage: "checklist") }.help("Select all Learning words")
                             Button(action: onCopyAll) { Label("Copy all Learning words", systemImage: "doc.on.doc") }.help("Copy all Learning words")
                         }
@@ -514,6 +668,10 @@ struct DetailViewContent: View {
                         Button(action: onUndo) { Label("Undo", systemImage: "arrow.uturn.backward") }.help("Undo").disabled(dbManager.undoStack.isEmpty)
                         Button(action: onRefresh) { Label("Refresh list", systemImage: "arrow.clockwise") }.help("Refresh list")
                         Button(action: onPromptCopy) { Label("Copy with prompt", systemImage: "text.append") }.help("Copy with prompt").disabled(selectedWordIds.isEmpty)
+                        if isClaudeConnected {
+                            Button(action: onGenerateSelected) { Label("Generate flashcards", systemImage: "sparkles") }
+                                .help("Generate flashcards").disabled(selectedWordIds.isEmpty || isGenerating)
+                        }
                     }
                 }
                 .onCopyCommand {
@@ -550,6 +708,96 @@ struct DetailViewContent: View {
     }
 }
 
+// Flashcards generated by Claude Code for a set of words, shown beside them until closed.
+struct FlashcardPanel {
+    let words: [Word] // as sent, in order, with their status at that time
+    var cards: [Word.ID: String] = [:]
+    var isGenerating = true
+    var error: String?
+    // Each word as last seen in the word list. The column stays open while the list shows another
+    // book or a search, and Copy and Append must still know which words were Ignored.
+    private var latest: [Word.ID: Word] = [:]
+
+    init(words: [Word]) { self.words = words }
+
+    mutating func update(from list: [Word]) {
+        let ids = Set(words.map(\.id))
+        for word in list where ids.contains(word.id) { latest[word.id] = word }
+    }
+
+    // The cards of every word not Ignored, in the order sent, with each word's current status.
+    var kept: [(word: Word, card: String)] {
+        words.map { latest[$0.id] ?? $0 }
+            .filter { $0.status != .ignored }
+            .compactMap { word in cards[word.id].map { (word, $0) } }
+    }
+
+    // Unignore returns a word to its status when the cards were made (Learning if it was Ignored then).
+    func statusAfterUnignore(of id: Word.ID) -> WordStatus {
+        let sent = words.first { $0.id == id }?.status ?? .learning
+        return sent == .ignored ? .learning : sent
+    }
+}
+
+// Above the flashcard column: progress or error, Append to a note, Copy flashcards, Close.
+struct FlashcardPanelHeader: View {
+    let panel: FlashcardPanel
+    let onAppend: () -> Void
+    let onCopy: () -> Void
+    let onClose: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if panel.isGenerating {
+                ProgressView().controlSize(.small)
+                Text("Generating \(panel.words.count) flashcards…").foregroundStyle(.secondary).lineLimit(1)
+            } else if let error = panel.error {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+                Text(error).foregroundStyle(.secondary).lineLimit(2).help(error)
+            } else {
+                Text("\(panel.cards.count) flashcards").foregroundStyle(.secondary).lineLimit(1)
+            }
+            Spacer(minLength: 8)
+            // The buttons keep their full width; the status text above gives way on a narrow window
+            Group {
+                Button("Append cards to .md note", action: onAppend).disabled(panel.cards.isEmpty)
+                NoteMenu()
+                Button("Copy flashcards", action: onCopy).disabled(panel.cards.isEmpty)
+                Button(action: onClose) { Image(systemName: "xmark") }
+                    .buttonStyle(.borderless)
+                    .help(panel.isGenerating ? "Stop and close flashcards" : "Close flashcards")
+            }
+            .fixedSize()
+        }
+        .font(.callout)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+}
+
+struct FlashcardCell: View {
+    let word: Word
+    let panel: FlashcardPanel
+
+    var body: some View {
+        content
+            .font(.callout)
+            .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder private var content: some View {
+        if let card = panel.cards[word.id] {
+            Text(verbatim: card)
+                .strikethrough(word.status == .ignored, color: .gray)
+                .foregroundColor(word.status == .ignored ? .gray : .primary) // Ignored: left out of Copy
+        } else if panel.words.contains(where: { $0.id == word.id }) {
+            Text(panel.isGenerating ? "Generating…" : "No flashcard").foregroundStyle(.secondary)
+        } else {
+            Color.clear.frame(height: 0) // keeps the column as wide on rows without a card
+        }
+    }
+}
+
 struct ToastView: View {
     let message: String
     var body: some View { VStack { Spacer(); Text(message).font(.title2).padding(20).background(.regularMaterial).cornerRadius(12).shadow(radius: 8).padding(.bottom, 60).transition(.opacity) }.zIndex(1) }
@@ -577,8 +825,13 @@ extension DatabaseManager {
         return learning
     }
 
-    func formatSelected(ids: Set<Word.ID>) -> String { words.filter { ids.contains($0.id) }.map { "\($0.text)\n\($0.usage ?? "")" }.joined(separator: "\n\n") }
-    func formatAllLearning() -> String { learningWords().map { "\($0.text)\n\($0.usage ?? "")" }.joined(separator: "\n\n") }
+    // Settings ▸ "Add the frequency rank to copied words"
+    static var copiesRank: Bool { UserDefaults.standard.bool(forKey: "copyRank") }
+    func formatSelected(ids: Set<Word.ID>) -> String { format(words.filter { ids.contains($0.id) }) }
+    func formatAllLearning() -> String { format(learningWords()) }
+    private func format(_ words: [Word]) -> String {
+        words.map { $0.clipboardText(withRank: Self.copiesRank) }.joined(separator: "\n\n")
+    }
     func learningWordIds(limit: Int) -> [Word.ID] { learningWords(limit: limit).map(\.id) }
     func masterAllLearning() { updateStatus(words: learningWords(), newStatus: .mastered) }
     func masterSelected(ids: Set<Word.ID>) { updateStatus(words: words.filter { ids.contains($0.id) && $0.status != .mastered }, newStatus: .mastered) }

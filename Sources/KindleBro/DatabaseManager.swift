@@ -1,5 +1,4 @@
 import Foundation
-import NaturalLanguage
 import SQLite
 import SQLite3
 
@@ -102,6 +101,7 @@ class DatabaseManager: ObservableObject {
             
             try createSettingsTable()
             try createIndices()
+            try db?.run(Self.createBookAddedTable)
             
             DispatchQueue.main.async {
                 self.isDatabaseLoaded = true
@@ -225,7 +225,12 @@ class DatabaseManager: ObservableObject {
         return dbQueue.sync(execute: work)
     }
     
+    // When a sync first brought in each BOOK_INFO row. Books from before 1.4 and from the first import
+    // have no row here and fall back to their first lookup (see fetchBooks).
+    static let createBookAddedTable = "CREATE TABLE IF NOT EXISTS book_added (book_id TEXT PRIMARY KEY, added_at INTEGER NOT NULL)"
+    
     static func mergeDatabase(sourceURL: URL, into db: Connection) throws -> Int {
+        try db.run(createBookAddedTable)
         // ATTACH is not allowed inside a transaction, so attach first.
         try db.run("ATTACH DATABASE ? AS source", sourceURL.path)
         defer { _ = try? db.run("DETACH DATABASE source") }
@@ -236,6 +241,11 @@ class DatabaseManager: ObservableObject {
             // If the ID exists, IGNORE (keep local). This preserves 'category' (Mastered status).
             try db.run("INSERT OR IGNORE INTO main.WORDS SELECT * FROM source.WORDS")
             addedWords = db.changes
+            // Date the new book rows now, in ms like lookup timestamps; must run before they join BOOK_INFO.
+            try db.run("""
+                INSERT OR IGNORE INTO main.book_added (book_id, added_at)
+                SELECT id, ? FROM source.BOOK_INFO WHERE id NOT IN (SELECT id FROM main.BOOK_INFO)
+                """, Int64(Date().timeIntervalSince1970 * 1000))
             try db.run("INSERT OR IGNORE INTO main.BOOK_INFO SELECT * FROM source.BOOK_INFO")
             try db.run("INSERT OR IGNORE INTO main.LOOKUPS SELECT * FROM source.LOOKUPS")
         }
@@ -301,7 +311,21 @@ class DatabaseManager: ObservableObject {
                     bookMap[bookKey] = book
                 }
                 
-                let sortedBooks = bookMap.values.sorted(by: { $0.title < $1.title })
+                // Date added: the sync that brought the book in, else its first lookup (no book_added row).
+                // MIN over the book's rows, so a copy of a known book from another Kindle keeps the earlier date.
+                let datesSQL = """
+                SELECT B.title, B.authors, MIN(COALESCE(BA.added_at, F.first_ts))
+                FROM BOOK_INFO B
+                JOIN (SELECT book_key, MIN(timestamp) AS first_ts FROM LOOKUPS GROUP BY book_key) F ON F.book_key = B.id
+                LEFT JOIN book_added BA ON BA.book_id = B.id
+                GROUP BY B.title, B.authors
+                """
+                for row in try db.prepare(datesSQL) {
+                    bookMap["\(row[0] as! String)_\(row[1] as! String)"]?.dateAdded = row[2] as? Int64 ?? 0
+                }
+                
+                // Alphabetical here; the sidebar re-sorts by date added (a stable sort, so ties stay alphabetical).
+                let sortedBooks = bookMap.values.sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
                 
                 DispatchQueue.main.async {
                 self.books = sortedBooks
@@ -371,46 +395,6 @@ class DatabaseManager: ObservableObject {
 
     // Bump when `lemma(...)` changes, so stored lemmas are recomputed.
     private static let lemmaVersion = "2"
-
-    // Archaic pronouns: Apple maps thy, thine and thou to "thee", but each is its own word to learn.
-    private static let keepAsWritten: Set<String> = ["thou", "thee", "thy", "thine", "ye"]
-
-    // Dictionary form of a looked-up word: "vitiated" and "vitiates" both give "vitiate".
-    // Order: Apple's lemma for the word in its sentence (tells "drawing" the noun from "draw"),
-    // then for the word alone, then Kindle's stem (right for many rare words Apple doesn't know).
-    // Entries with spaces, hyphens or apostrophes stay as they are: the tagger splits them,
-    // which would merge "beau-ideal" into "beau".
-    static func lemma(word: String, language: String, kindleStem: String?, usage: String?) -> String {
-        let lower = word.lowercased()
-        guard !word.isEmpty, word.unicodeScalars.allSatisfy(CharacterSet.letters.contains),
-              !keepAsWritten.contains(lower) else { return lower }
-        let nl = NLLanguage(String(language.prefix { $0 != "-" }).lowercased())
-        if let usage, let found = taggedLemma(of: word, in: usage, language: nl) { return found }
-        if let found = taggedLemma(of: word, in: word, language: nl) { return found }
-        // Kindle's stem only if it starts like the word: it stems "insentience" as "sentience",
-        // which linked unrelated books. Accents are ignored, so "eclat" -> "éclat" still passes.
-        if let stem = kindleStem?.lowercased(), !stem.isEmpty,
-           stem.folding(options: .diacriticInsensitive, locale: nil)
-               .hasPrefix(lower.folding(options: .diacriticInsensitive, locale: nil).prefix(2)) {
-            return stem
-        }
-        return lower
-    }
-
-    private static func taggedLemma(of word: String, in text: String, language: NLLanguage) -> String? {
-        let tagger = NLTagger(tagSchemes: [.lemma])
-        tagger.string = text
-        tagger.setLanguage(language, range: text.startIndex..<text.endIndex)
-        var result: String?
-        tagger.enumerateTags(in: text.startIndex..<text.endIndex, unit: .word, scheme: .lemma,
-                             options: [.omitPunctuation, .omitWhitespace]) { tag, range in
-            // Whole-token match: matching a substring turned "so" into the lemma of "sob".
-            guard text[range].compare(word, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame else { return true }
-            result = tag?.rawValue.lowercased()
-            return false
-        }
-        return result?.isEmpty == false ? result : nil
-    }
 
     // Computes lemmas for words that have none yet (new library, new import, or a new lemmaVersion).
     // Stored so SQL can group by them; about 1 s for 4k words, once.
@@ -514,7 +498,7 @@ class DatabaseManager: ObservableObject {
     }
 
     // Builds a Word from a row shaped: id, word, category, usage, timestamp,
-    // book id, book title, book authors, related_book_count, usage_count, lemma
+    // book id, book title, book authors, related_book_count, usage_count, lemma, lang
     private func makeWord(_ row: Statement.Element) -> Word {
         let id = row[0] as! String
         let text = row[1] as! String
@@ -540,7 +524,8 @@ class DatabaseManager: ObservableObject {
             bookTitle: bookTitle,
             bookAuthors: bookAuthors,
             timestamp: ts,
-            relatedBookCount: Int(row[8] as! Int64)
+            relatedBookCount: Int(row[8] as! Int64),
+            rank: FrequencyRanks.rank(lemma: lemma, text: text, language: row[11] as? String ?? "")
         )
     }
     
@@ -680,7 +665,8 @@ class DatabaseManager: ObservableObject {
                     B.id as book_id, B.title as book_title, B.authors as book_authors,
                     \(relatedSelect)
                     usage_counts.usage_count,
-                    COALESCE(WL.lemma, lower(W.word)) as lemma
+                    COALESCE(WL.lemma, lower(W.word)) as lemma,
+                    W.lang
                 FROM latest
                 JOIN WORDS W ON W.id = latest.word_key
                 JOIN BOOK_INFO B ON B.id = latest.book_key
@@ -819,7 +805,8 @@ class DatabaseManager: ObservableObject {
                     (SELECT COUNT(*)
                      FROM LOOKUPS L4
                      WHERE L4.word_key = W.id AND L4.book_key = B.id) as usage_count,
-                    WL.lemma as lemma
+                    WL.lemma as lemma,
+                    W.lang
                 FROM word_lemmas WL
                 JOIN WORDS W ON W.id = WL.word_id
                 JOIN LOOKUPS L ON L.word_key = W.id

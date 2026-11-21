@@ -50,7 +50,7 @@ private struct AboutWindow: View {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "KindleBro"
     }
     private var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.5"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev" // no Info.plist outside the app bundle (swift run)
     }
     
     var body: some View {
@@ -87,11 +87,13 @@ private struct PromptEditorWindow: View {
     @AppStorage("customPrompt") private var customPrompt = defaultPrompt
     
     var body: some View {
-        // Save to the library here, not in the main window: that one may be closed.
-        PromptEditorView(prompt: $customPrompt)
-            .onChange(of: customPrompt) { _, newValue in
-                DatabaseManager.shared.saveSetting(key: "customPrompt", value: newValue)
-            }
+        // Save to the library in the setter. An onChange here never ran: Save closes this window in the
+        // same click, before SwiftUI's next update, so only UserDefaults got the new prompt, and the
+        // library's old copy replaced it on the next launch or sync.
+        PromptEditorView(prompt: Binding(get: { customPrompt }, set: {
+            customPrompt = $0
+            DatabaseManager.shared.saveSetting(key: "customPrompt", value: $0)
+        }))
     }
 }
 
@@ -107,8 +109,15 @@ struct KindleBroApp: App {
             "enableRelatedWords": true,
             "enableCompletedBooks": true,
             "autoMasterOnCopy": true,
+            "copyRank": true,
             "learningBatchSize": 15,
             "customPrompt": defaultPrompt,
+            "autoSyncOnLaunch": true,
+            "bookSort": BookSort.dateAdded.rawValue,
+            "claudeCLIPath": "",
+            "claudeModel": "",
+            "noteAddHeadings": true,
+            "noteAddAtTop": true,
         ])
         
         // Settings opens with the cursor in its only text field (batch size). Clear it at the AppKit

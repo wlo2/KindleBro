@@ -12,7 +12,8 @@ struct WordRow: View {
     let enableRelatedWords: Bool
     let showBookTitle: Bool
     let dbManager: DatabaseManager // only for fetches; observing it re-rendered every row on any change
-    
+    var onToggleIgnore: (() -> Void)? = nil // set while the word has a generated flashcard
+
     @State private var isExpanded = false
     @State private var isRelatedPopoverPresented = false
     @State private var isRelatedLoading = false
@@ -161,6 +162,13 @@ struct WordRow: View {
                     }
                     .transaction { $0.animation = nil }
                 }
+
+                if let rank = word.rank {
+                    Text("Rank #\(rank.formatted())")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .help("How common the word is in English fiction: #1 is the most common")
+                }
                 
                 if word.status == .mastered {
                     Image(systemName: "checkmark.circle.fill")
@@ -288,8 +296,15 @@ struct WordRow: View {
                         .font(.caption2)
                         .foregroundColor(.secondary.opacity(0.7))
                 }
-                
-                Button(action: { 
+
+                // Quick review of generated flashcards: Ignored words are left out of Copy flashcards
+                if isSelected, let onToggleIgnore {
+                    Button(word.status == .ignored ? "Unignore" : "Ignore", action: onToggleIgnore)
+                        .controlSize(.small)
+                        .help(word.status == .ignored ? "Mark as Learning" : "Mark as Ignored")
+                }
+
+                Button(action: {
                     var textToCopy = usageObj.text
                     if let bookTitle = word.bookTitle {
                         textToCopy += " «\(bookTitle)»"
@@ -310,7 +325,7 @@ struct WordRow: View {
 }
 
 // Rounded highlight on hover, like native menu and toolbar items, so rows read as clickable.
-private struct HoverHighlight: ViewModifier {
+struct HoverHighlight: ViewModifier {
     @State private var isHovered = false
 
     func body(content: Content) -> some View {

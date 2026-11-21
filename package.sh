@@ -49,6 +49,7 @@ fi
 
 # 4. Copy Info.plist
 cp Info.plist "${APP_BUNDLE}/Contents/"
+cp Resources/english_ranks.txt "${APP_BUNDLE}/Contents/Resources/" || exit 1
 
 # 5. Generate and copy app icon
 if [ -f "$ICON_SRC" ]; then
@@ -78,7 +79,7 @@ if [ -f "$ICON_SRC" ]; then
         done
     fi
 
-    iconutil -c icns "$ICONSET_DIR" -o "${APP_BUNDLE}/Contents/Resources/${ICON_NAME}.icns"
+    iconutil -c icns "$ICONSET_DIR" -o "${APP_BUNDLE}/Contents/Resources/${ICON_NAME}.icns" || exit 1
     # Nudge Finder to refresh the app icon cache
     touch "${APP_BUNDLE}/Contents/Info.plist"
     touch "${APP_BUNDLE}"
@@ -88,7 +89,7 @@ fi
 
 # 6. Sign (Ad-hoc) to run locally
 echo "Signing..."
-codesign --force --deep --sign - "${APP_BUNDLE}"
+codesign --force --deep --sign - "${APP_BUNDLE}" || exit 1 # macOS won't open an unsigned app on Apple silicon
 
 # 7. Create DMG
 echo "Creating ${DMG_NAME}..."
@@ -96,7 +97,7 @@ rm -f "$DMG_NAME"
 STAGING_DIR="$(mktemp -d)"
 cp -R "${APP_BUNDLE}" "${STAGING_DIR}/"
 ln -s /Applications "${STAGING_DIR}/Applications"
-hdiutil create -volname "${APP_NAME}" -srcfolder "${STAGING_DIR}" -ov -format UDZO "${DMG_NAME}"
+hdiutil create -volname "${APP_NAME}" -srcfolder "${STAGING_DIR}" -ov -format UDZO "${DMG_NAME}" || exit 1
 rm -rf "${STAGING_DIR}"
 
 echo "Done! Created ${DMG_NAME}"
